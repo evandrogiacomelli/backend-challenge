@@ -4,7 +4,7 @@ import { Test } from '@nestjs/testing';
 import { AppModule } from '../src/app.module.js';
 
 describe('Application bootstrap', () => {
-  test('should initialize the root module', async () => {
+  test('should initialize the root modules', async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
