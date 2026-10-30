@@ -13,15 +13,15 @@ export default defineConfig({
   entities: [],
   discovery: {
     warnWhenNoEntities: false,
-},
+  },
 
-extensions: [Migrator],
+  extensions: [Migrator],
 
-migrations: {
-  path: './dist/migrations',
-  pathTs: './src/migrations',
-  emit: 'ts',
-  transactional: true,
-  allOrNothing: true,
-},
+  migrations: {
+    path: './dist/migrations',
+    pathTs: './src/migrations',
+    emit: 'ts',
+    transactional: true,
+    allOrNothing: true,
+  },
 });
