@@ -1,0 +1,60 @@
+# Dependencies
+/node_modules/
+
+# Build output
+/dist/
+/build/
+/coverage/
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs
+/logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+bun-debug.log*
+
+# Temporary files
+/.temp/
+/.tmp/
+/tmp/
+*.tmp
+*.cache
+
+# Test artifacts
+/.nyc_output/
+/test-results/
+/playwright-report/
+
+# IDE
+/.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Operating systems
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker local data
+/docker-data/
+/postgres-data/
+/localstack-data/
+
+# Runtime
+pids
+*.pid
+*.pid.lock
+*.seed
+
+# Diagnostic reports
+report.*.json
