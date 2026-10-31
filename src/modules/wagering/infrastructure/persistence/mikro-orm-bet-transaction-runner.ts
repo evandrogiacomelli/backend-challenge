@@ -1,4 +1,6 @@
 
+import { randomUUID } from 'node:crypto';
+
 import {
   LockMode,
   UniqueConstraintViolationException,
@@ -8,6 +10,7 @@ import { Injectable } from '@nestjs/common';
 
 import { Money } from '../../../../shared/domain/money.js';
 import { WalletLedgerEntryEntity } from '../../../ledger/infrastructure/persistence/wallet-ledger-entry.entity.js';
+import { OutboxMessageEntity } from '../../../messaging/outbox/infrastructure/persistence/outbox-message.entity.js';
 import { Wallet } from '../../../wallet/domain/wallet.js';
 import { WalletEntity } from '../../../wallet/infrastructure/persistence/wallet.entity.js';
 import {
@@ -20,6 +23,7 @@ import {
   type StoredBet,
 } from '../../application/ports/bet-transaction-runner.js';
 import type { WagerTransaction } from '../../domain/wager-transaction.js';
+import { WagerTransactionStatus } from '../../domain/wager-transaction.js';
 import { WagerTransactionEntity } from './wager-transaction.entity.js';
 
 @Injectable()
@@ -86,8 +90,6 @@ export class MikroOrmBetTransactionRunner
             throw new WalletNotFoundError();
           }
 
-          // Recheck after the wallet lock. Another request
-          // may have committed while we were waiting.
           const byKey = await tx.findOne(
             WagerTransactionEntity,
             {
@@ -211,16 +213,34 @@ export class MikroOrmBetTransactionRunner
                 ledger.balanceAfter.toJSON().amount;
               ledgerEntity.createdAt = ledger.createdAt;
 
+              const outboxEntity =
+                this.createOutboxMessage(
+                  transaction,
+                  snapshot,
+                );
+
               tx.persist(transactionEntity);
               tx.persist(ledgerEntity);
+              tx.persist(outboxEntity);
 
               await tx.flush();
             },
 
-            saveRejected: async (transaction, snapshot) => {
-              tx.persist(
-                toTransactionEntity(transaction, snapshot),
-              );
+            saveRejected: async (
+              transaction,
+              snapshot,
+            ) => {
+              const transactionEntity =
+                toTransactionEntity(transaction, snapshot);
+
+              const outboxEntity =
+                this.createOutboxMessage(
+                  transaction,
+                  snapshot,
+                );
+
+              tx.persist(transactionEntity);
+              tx.persist(outboxEntity);
 
               await tx.flush();
             },
@@ -239,6 +259,64 @@ export class MikroOrmBetTransactionRunner
 
       throw error;
     }
+  }
+
+  protected createOutboxMessage(
+    transaction: WagerTransaction,
+    snapshot: BetResponseSnapshot,
+  ): OutboxMessageEntity {
+    if (
+      transaction.status !==
+      WagerTransactionStatus.Processed &&
+      transaction.status !==
+      WagerTransactionStatus.Rejected
+    ) {
+      throw new Error(
+        'Cannot publish event for non-terminal BET',
+      );
+    }
+
+    const now = new Date();
+    const occurredAt = transaction.processedAt ?? now;
+
+    const entity = new OutboxMessageEntity();
+
+    entity.id = randomUUID();
+    entity.aggregateId = transaction.walletId;
+
+    entity.eventType =
+      transaction.status === WagerTransactionStatus.Processed
+        ? 'wager.bet.processed.v1'
+        : 'wager.bet.rejected.v1';
+
+    entity.payload = {
+      eventId: entity.id,
+      schemaVersion: 1,
+      transactionId: transaction.id,
+      walletId: transaction.walletId,
+      playerId: transaction.playerId,
+      providerId: transaction.providerId,
+      externalTransactionId:
+      transaction.externalTransactionId,
+      roundId: transaction.roundId,
+      gameId: transaction.gameId,
+      kind: transaction.kind,
+      status: transaction.status,
+      amount: transaction.money.toJSON().amount,
+      currency: transaction.money.currency,
+      resultingBalance: { ...snapshot.balance },
+      walletVersion: snapshot.walletVersion,
+      failureCode: snapshot.failureCode ?? null,
+      occurredAt: occurredAt.toISOString(),
+    };
+
+    entity.status = 'PENDING';
+    entity.attempts = 0;
+    entity.nextAttemptAt = now;
+    entity.occurredAt = occurredAt;
+    entity.createdAt = now;
+
+    return entity;
   }
 
   private toStoredBet(
