@@ -27,6 +27,7 @@
     "db:pending": "bunx mikro-orm migration:pending --config ./src/config/mikro-orm.config.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1161.0",
     "@mikro-orm/core": "^7.2.5",
     "@mikro-orm/decorators": "^7.2.5",
     "@mikro-orm/migrations": "^7.2.5",

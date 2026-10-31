@@ -1,3 +1,4 @@
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -17,5 +18,19 @@ services:
       timeout: 3s
       retries: 10
 
+
+  localstack:
+    image: localstack/localstack:4.14.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+    volumes:
+      - localstack-data:/var/lib/localstack
+
 volumes:
   postgres_data:
+  localstack-data:
