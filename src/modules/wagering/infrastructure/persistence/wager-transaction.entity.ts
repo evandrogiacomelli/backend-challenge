@@ -301,4 +301,14 @@ export class WagerTransactionEntity {
     nullable: true,
   })
   processedAt?: Date;
+
+
+  @Property({
+    type: 'json',
+    columnType: 'jsonb',
+    fieldName: 'response_snapshot',
+    nullable: true,
+  })
+  responseSnapshot?: Record<string, unknown>;
+
 }

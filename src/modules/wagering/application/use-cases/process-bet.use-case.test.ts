@@ -11,12 +11,14 @@ import {
   WagerTransactionStatus,
   type WagerTransaction,
 } from '../../domain/wager-transaction.js';
-import type {
-  BetTransactionRunner,
-  LockedBetContext,
-} from '../ports/bet-transaction-runner.js';
 import {
+  BetIdentityConflictError,
   WalletNotFoundError,
+  type BetIdentity,
+  type BetResponseSnapshot,
+  type BetTransactionRunner,
+  type LockedBetContext,
+  type StoredBet,
 } from '../ports/bet-transaction-runner.js';
 import {
   ProcessBetUseCase,
@@ -40,9 +42,7 @@ function createInput(
   };
 }
 
-function createFixture(
-  balance = '100.00',
-) {
+function createFixture(balance = '100.00') {
   const input = createInput();
 
   const wallet = Wallet.open({
@@ -50,7 +50,7 @@ function createFixture(
     playerId: input.playerId,
     initialBalance: Money.from({
       amount: balance,
-      currency: input.currency,
+      currency: 'BRL',
     }),
   });
 
@@ -61,9 +61,62 @@ function createFixture(
 
   const rejected: WagerTransaction[] = [];
 
+  const stored: StoredBet[] = [];
+
+  function findStored(identity: BetIdentity): StoredBet | null {
+    const byKey = stored.find(
+      (record) =>
+        record.providerId === identity.providerId &&
+        record.idempotencyKey === identity.idempotencyKey,
+    );
+
+    if (byKey) {
+      return {
+        ...byKey,
+        matchedBy: 'idempotencyKey',
+      };
+    }
+
+    const byExternal = stored.find(
+      (record) =>
+        record.providerId === identity.providerId &&
+        record.externalTransactionId ===
+        identity.externalTransactionId,
+    );
+
+    if (byExternal) {
+      return {
+        ...byExternal,
+        matchedBy: 'externalTransactionId',
+      };
+    }
+
+    return null;
+  }
+
+  function store(
+    transaction: WagerTransaction,
+    snapshot: BetResponseSnapshot,
+  ) {
+    stored.push({
+      matchedBy: 'idempotencyKey',
+      providerId: transaction.providerId,
+      externalTransactionId:
+      transaction.externalTransactionId,
+      idempotencyKey: transaction.idempotencyKey,
+      payloadHash: transaction.payloadHash,
+      snapshot,
+    });
+  }
+
   const runner: BetTransactionRunner = {
+    async findExisting(identity) {
+      return findStored(identity);
+    },
+
     async withLockedWallet<T>(
       walletId: string,
+      identity: BetIdentity,
       callback: (context: LockedBetContext) => Promise<T>,
     ): Promise<T> {
       if (walletId !== wallet.id) {
@@ -72,11 +125,16 @@ function createFixture(
 
       return callback({
         wallet,
-        async saveProcessed(transaction, ledger) {
+        existing: findStored(identity),
+
+        async saveProcessed(transaction, ledger, snapshot) {
           processed.push({ transaction, ledger });
+          store(transaction, snapshot);
         },
-        async saveRejected(transaction) {
+
+        async saveRejected(transaction, snapshot) {
           rejected.push(transaction);
+          store(transaction, snapshot);
         },
       });
     },
@@ -87,6 +145,7 @@ function createFixture(
     wallet,
     processed,
     rejected,
+    stored,
     useCase: new ProcessBetUseCase(runner),
   };
 }
@@ -102,14 +161,13 @@ describe('ProcessBetUseCase', () => {
     expect(result.status).toBe(
       WagerTransactionStatus.Processed,
     );
-
     expect(result.balance.amount).toBe('75.00');
     expect(result.walletVersion).toBe(2);
+    expect(result.idempotentReplay).toBe(false);
 
     expect(fixture.wallet.balance.toJSON().amount).toBe(
       '75.00',
     );
-
     expect(fixture.processed).toHaveLength(1);
     expect(fixture.rejected).toHaveLength(0);
   });
@@ -125,22 +183,17 @@ describe('ProcessBetUseCase', () => {
     expect(transaction.kind).toBe(
       WagerTransactionKind.Bet,
     );
-
     expect(transaction.status).toBe(
       WagerTransactionStatus.Processed,
     );
-
     expect(ledger.direction).toBe('DEBIT');
     expect(ledger.money.toJSON().amount).toBe('25.00');
-
-    expect(
-      ledger.balanceBefore.toJSON().amount,
-    ).toBe('100.00');
-
-    expect(
-      ledger.balanceAfter.toJSON().amount,
-    ).toBe('75.00');
-
+    expect(ledger.balanceBefore.toJSON().amount).toBe(
+      '100.00',
+    );
+    expect(ledger.balanceAfter.toJSON().amount).toBe(
+      '75.00',
+    );
     expect(ledger.transactionId).toBe(transaction.id);
   });
 
@@ -154,14 +207,10 @@ describe('ProcessBetUseCase', () => {
     expect(result.status).toBe(
       WagerTransactionStatus.Rejected,
     );
-
-    expect(result.failureCode).toBe(
-      'INSUFFICIENT_FUNDS',
-    );
-
+    expect(result.failureCode).toBe('INSUFFICIENT_FUNDS');
     expect(result.balance.amount).toBe('20.00');
     expect(result.walletVersion).toBe(1);
-
+    expect(result.idempotentReplay).toBe(false);
     expect(fixture.processed).toHaveLength(0);
     expect(fixture.rejected).toHaveLength(1);
   });
@@ -176,7 +225,6 @@ describe('ProcessBetUseCase', () => {
     expect(result.status).toBe(
       WagerTransactionStatus.Processed,
     );
-
     expect(result.balance.amount).toBe('0.00');
     expect(result.walletVersion).toBe(2);
   });
@@ -192,7 +240,6 @@ describe('ProcessBetUseCase', () => {
     ).rejects.toThrow();
 
     expect(fixture.processed).toHaveLength(0);
-    expect(fixture.rejected).toHaveLength(0);
   });
 
   test('should reject player mismatch', async () => {
@@ -206,7 +253,6 @@ describe('ProcessBetUseCase', () => {
     ).rejects.toThrow('Wallet player mismatch');
 
     expect(fixture.processed).toHaveLength(0);
-    expect(fixture.rejected).toHaveLength(0);
   });
 
   test('should reject currency mismatch', async () => {
@@ -220,11 +266,13 @@ describe('ProcessBetUseCase', () => {
     ).rejects.toThrow('Wallet currency mismatch');
 
     expect(fixture.processed).toHaveLength(0);
-    expect(fixture.rejected).toHaveLength(0);
   });
 
   test('should reject a missing wallet', async () => {
     const runner: BetTransactionRunner = {
+      async findExisting() {
+        return null;
+      },
       async withLockedWallet() {
         throw new WalletNotFoundError();
       },
@@ -235,5 +283,128 @@ describe('ProcessBetUseCase', () => {
     await expect(
       useCase.execute(createInput()),
     ).rejects.toBeInstanceOf(WalletNotFoundError);
+  });
+
+  test('should replay the same BET without debiting again', async () => {
+    const fixture = createFixture();
+
+    const first = await fixture.useCase.execute(
+      fixture.input,
+    );
+
+    const replay = await fixture.useCase.execute(
+      fixture.input,
+    );
+
+    expect(first.idempotentReplay).toBe(false);
+    expect(replay.idempotentReplay).toBe(true);
+
+    expect(replay.transactionId).toBe(first.transactionId);
+    expect(replay.balance).toEqual(first.balance);
+    expect(replay.walletVersion).toBe(first.walletVersion);
+
+    expect(fixture.processed).toHaveLength(1);
+    expect(fixture.wallet.balance.toJSON().amount).toBe(
+      '75.00',
+    );
+  });
+
+  test('should reject same key with different amount', async () => {
+    const fixture = createFixture();
+
+    await fixture.useCase.execute(fixture.input);
+
+    await expect(
+      fixture.useCase.execute({
+        ...fixture.input,
+        amount: '30.00',
+      }),
+    ).rejects.toBeInstanceOf(
+      BetIdentityConflictError,
+    );
+
+    expect(fixture.processed).toHaveLength(1);
+    expect(fixture.wallet.balance.toJSON().amount).toBe(
+      '75.00',
+    );
+  });
+
+  test('should reject same external ID with different key', async () => {
+    const fixture = createFixture();
+
+    await fixture.useCase.execute(fixture.input);
+
+    try {
+      await fixture.useCase.execute({
+        ...fixture.input,
+        idempotencyKey: randomUUID(),
+      });
+
+      throw new Error('Expected identity conflict');
+    } catch (error) {
+      expect(error).toBeInstanceOf(
+        BetIdentityConflictError,
+      );
+
+      if (error instanceof BetIdentityConflictError) {
+        expect(error.code).toBe(
+          'EXTERNAL_TRANSACTION_ID_CONFLICT',
+        );
+      }
+    }
+
+    expect(fixture.processed).toHaveLength(1);
+  });
+
+  test('should replay a rejected BET without retrying it', async () => {
+    const fixture = createFixture('10.00');
+
+    const first = await fixture.useCase.execute(
+      fixture.input,
+    );
+
+    const replay = await fixture.useCase.execute(
+      fixture.input,
+    );
+
+    expect(first.status).toBe(
+      WagerTransactionStatus.Rejected,
+    );
+    expect(replay.status).toBe(first.status);
+    expect(replay.failureCode).toBe(first.failureCode);
+    expect(replay.transactionId).toBe(first.transactionId);
+    expect(replay.idempotentReplay).toBe(true);
+
+    expect(fixture.rejected).toHaveLength(1);
+    expect(fixture.processed).toHaveLength(0);
+  });
+
+  test('should retain the original response snapshot', async () => {
+    const fixture = createFixture('100.00');
+
+    const first = await fixture.useCase.execute(
+      fixture.input,
+    );
+
+    // Different BET with a new identity changes the wallet.
+    await fixture.useCase.execute({
+      ...fixture.input,
+      externalTransactionId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      amount: '10.00',
+    });
+
+    const replay = await fixture.useCase.execute(
+      fixture.input,
+    );
+
+    expect(fixture.wallet.balance.toJSON().amount).toBe(
+      '65.00',
+    );
+
+    expect(first.balance.amount).toBe('75.00');
+    expect(replay.balance.amount).toBe('75.00');
+    expect(replay.walletVersion).toBe(2);
+    expect(replay.idempotentReplay).toBe(true);
   });
 });

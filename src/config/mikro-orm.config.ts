@@ -35,5 +35,7 @@ export default defineConfig({
     emit: 'ts',
     transactional: true,
     allOrNothing: true,
+    snapshot: true,
+    snapshotOnMigrate: false,
   },
 });

@@ -12,7 +12,12 @@ import {
 } from '../../domain/wager-transaction.js';
 import {
   BET_TRANSACTION_RUNNER,
+  BetIdentityConflictError,
+  BetWriteConflictError,
+  type BetIdentity,
+  type BetResponseSnapshot,
   type BetTransactionRunner,
+  type StoredBet,
 } from '../ports/bet-transaction-runner.js';
 
 export interface ProcessBetInput {
@@ -27,15 +32,8 @@ export interface ProcessBetInput {
   currency: string;
 }
 
-export interface ProcessBetOutput {
-  transactionId: string;
-  status: WagerTransactionStatus;
-  failureCode?: string;
-  balance: {
-    amount: string;
-    currency: string;
-  };
-  walletVersion: number;
+export interface ProcessBetOutput extends BetResponseSnapshot {
+  idempotentReplay: boolean;
 }
 
 @Injectable()
@@ -65,78 +63,172 @@ export class ProcessBetUseCase {
       money.currency,
     ]);
 
-    const payloadHash = createHash('sha256')
-      .update(canonicalPayload)
-      .digest('hex');
-
-    const transaction = WagerTransaction.create({
-      id: randomUUID(),
+    const identity: BetIdentity = {
       providerId: input.providerId,
       externalTransactionId: input.externalTransactionId,
       idempotencyKey: input.idempotencyKey,
-      payloadHash,
-      walletId: input.walletId,
-      playerId: input.playerId,
-      roundId: input.roundId,
-      gameId: input.gameId,
-      kind: WagerTransactionKind.Bet,
-      money,
-    });
+      payloadHash: createHash('sha256')
+        .update(canonicalPayload)
+        .digest('hex'),
+    };
 
-    return this.runner.withLockedWallet(
-      input.walletId,
-      async ({ wallet, saveProcessed, saveRejected }) => {
-        if (wallet.playerId !== input.playerId) {
-          throw new Error('Wallet player mismatch');
-        }
+    const existing = await this.runner.findExisting(identity);
 
-        if (wallet.currency !== money.currency) {
-          throw new Error('Wallet currency mismatch');
-        }
+    if (existing) {
+      return this.resolveExisting(existing, identity);
+    }
 
-        if (wallet.balance.isLessThan(money)) {
-          transaction.reject(
-            'INSUFFICIENT_FUNDS',
-            wallet.balance,
-          );
+    try {
+      return await this.runner.withLockedWallet(
+        input.walletId,
+        identity,
+        async (context) => {
+          if (context.existing) {
+            return this.resolveExisting(
+              context.existing,
+              identity,
+            );
+          }
 
-          await saveRejected(transaction);
+          const wallet = context.wallet;
 
-          return {
+          if (wallet.playerId !== input.playerId) {
+            throw new Error('Wallet player mismatch');
+          }
+
+          if (wallet.currency !== money.currency) {
+            throw new Error('Wallet currency mismatch');
+          }
+
+          const transaction = WagerTransaction.create({
+            id: randomUUID(),
+            providerId: input.providerId,
+            externalTransactionId: input.externalTransactionId,
+            idempotencyKey: input.idempotencyKey,
+            payloadHash: identity.payloadHash,
+            walletId: input.walletId,
+            playerId: input.playerId,
+            roundId: input.roundId,
+            gameId: input.gameId,
+            kind: WagerTransactionKind.Bet,
+            money,
+          });
+
+          if (wallet.balance.isLessThan(money)) {
+            transaction.reject(
+              'INSUFFICIENT_FUNDS',
+              wallet.balance,
+            );
+
+            const snapshot: BetResponseSnapshot = {
+              transactionId: transaction.id,
+              status: WagerTransactionStatus.Rejected,
+              failureCode: 'INSUFFICIENT_FUNDS',
+              balance: wallet.balance.toJSON(),
+              walletVersion: wallet.version,
+            };
+
+            await context.saveRejected(
+              transaction,
+              snapshot,
+            );
+
+            return {
+              ...snapshot,
+              idempotentReplay: false,
+            };
+          }
+
+          const movement = wallet.debit(money);
+
+          transaction.markProcessed({
+            resultingBalance: wallet.balance,
+          });
+
+          const ledger = WalletLedgerEntry.create({
+            id: randomUUID(),
+            walletId: wallet.id,
             transactionId: transaction.id,
-            status: transaction.status,
-            failureCode: 'INSUFFICIENT_FUNDS',
+            direction: 'DEBIT',
+            money,
+            balanceBefore: movement.balanceBefore,
+            balanceAfter: movement.balanceAfter,
+            createdAt: new Date(),
+          });
+
+          const snapshot: BetResponseSnapshot = {
+            transactionId: transaction.id,
+            status: WagerTransactionStatus.Processed,
             balance: wallet.balance.toJSON(),
             walletVersion: wallet.version,
           };
+
+          await context.saveProcessed(
+            transaction,
+            ledger,
+            snapshot,
+          );
+
+          return {
+            ...snapshot,
+            idempotentReplay: false,
+          };
+        },
+      );
+    } catch (error) {
+      // A concurrent transaction may have committed the
+      // same identity between our lookup and INSERT.
+      //
+      // The failed SQL transaction has already rolled back.
+      // Read again using a fresh transaction/EntityManager.
+      if (error instanceof BetWriteConflictError) {
+        const committed = await this.runner.findExisting(
+          identity,
+        );
+
+        if (committed) {
+          return this.resolveExisting(committed, identity);
         }
+      }
 
-        const movement = wallet.debit(money);
+      throw error;
+    }
+  }
 
-        transaction.markProcessed({
-          resultingBalance: wallet.balance,
-        });
+  private resolveExisting(
+    existing: StoredBet,
+    identity: BetIdentity,
+  ): ProcessBetOutput {
+    if (
+      existing.matchedBy === 'externalTransactionId' &&
+      existing.idempotencyKey !== identity.idempotencyKey
+    ) {
+      throw new BetIdentityConflictError(
+        'EXTERNAL_TRANSACTION_ID_CONFLICT',
+      );
+    }
 
-        const ledger = WalletLedgerEntry.create({
-          id: randomUUID(),
-          walletId: wallet.id,
-          transactionId: transaction.id,
-          direction: 'DEBIT',
-          money,
-          balanceBefore: movement.balanceBefore,
-          balanceAfter: movement.balanceAfter,
-          createdAt: new Date(),
-        });
+    if (
+      existing.idempotencyKey !== identity.idempotencyKey ||
+      existing.payloadHash !== identity.payloadHash ||
+      existing.externalTransactionId !==
+      identity.externalTransactionId
+    ) {
+      throw new BetIdentityConflictError(
+        'IDEMPOTENCY_KEY_CONFLICT',
+      );
+    }
 
-        await saveProcessed(transaction, ledger);
+    if (!existing.snapshot) {
+      throw new Error(
+        'Original BET response snapshot is unavailable',
+      );
+    }
 
-        return {
-          transactionId: transaction.id,
-          status: transaction.status,
-          balance: wallet.balance.toJSON(),
-          walletVersion: wallet.version,
-        };
-      },
-    );
+    return {
+      ...existing.snapshot,
+      balance: { ...existing.snapshot.balance },
+      idempotentReplay: true,
+    };
   }
 }

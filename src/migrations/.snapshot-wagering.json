@@ -735,6 +735,23 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "response_snapshot": {
+          "name": "response_snapshot",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
         "resulting_balance_amount": {
           "name": "resulting_balance_amount",
           "type": "numeric(19,2)",
