@@ -35,6 +35,34 @@ export class BetWriteConflictError extends Error {
   }
 }
 
+
+export interface InboxReceipt {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+}
+
+export class InboxAlreadyProcessedError extends Error {
+  constructor() {
+    super('Inbox message already processed');
+    this.name = 'InboxAlreadyProcessedError';
+  }
+}
+
+export class InboxPayloadConflictError extends Error {
+  constructor() {
+    super('Inbox message ID reused with different payload');
+    this.name = 'InboxPayloadConflictError';
+  }
+}
+
+export class InboxIncompleteError extends Error {
+  constructor() {
+    super('Inbox message exists but was not completed');
+    this.name = 'InboxIncompleteError';
+  }
+}
+
 export interface BetIdentity {
   providerId: string;
   externalTransactionId: string;
@@ -85,5 +113,6 @@ export interface BetTransactionRunner {
     walletId: string,
     identity: BetIdentity,
     callback: (context: LockedBetContext) => Promise<T>,
+    inbox?: InboxReceipt,
   ): Promise<T>;
 }

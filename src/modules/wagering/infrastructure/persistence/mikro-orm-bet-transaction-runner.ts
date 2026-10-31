@@ -1,4 +1,3 @@
-
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -21,6 +20,10 @@ import {
   type BetTransactionRunner,
   type LockedBetContext,
   type StoredBet,
+  InboxAlreadyProcessedError,
+  InboxPayloadConflictError,
+  InboxIncompleteError,
+  type InboxReceipt,
 } from '../../application/ports/bet-transaction-runner.js';
 import type { WagerTransaction } from '../../domain/wager-transaction.js';
 import { WagerTransactionStatus } from '../../domain/wager-transaction.js';
@@ -73,10 +76,71 @@ export class MikroOrmBetTransactionRunner
     walletId: string,
     identity: BetIdentity,
     callback: (context: LockedBetContext) => Promise<T>,
+    inbox?: InboxReceipt,
   ): Promise<T> {
     try {
       return await this.em.fork().transactional(
         async (tx) => {
+
+          if (inbox) {
+            const inserted = await tx.execute<
+              Array<{ id: string }>
+            >(
+              `INSERT INTO inbox_messages (
+                id,
+                consumer_name,
+                message_id,
+                payload_hash,
+                received_at
+              )
+              VALUES (?, ?, ?, ?, NOW())
+              ON CONFLICT (consumer_name, message_id)
+              DO NOTHING
+              RETURNING id`,
+              [
+                randomUUID(),
+                inbox.consumerName,
+                inbox.messageId,
+                inbox.payloadHash,
+              ],
+              'all',
+            );
+
+            if (inserted.length === 0) {
+              const rows = await tx.execute<
+                Array<{
+                  payload_hash: string;
+                  processed_at: Date | null;
+                }>
+              >(
+                `
+                SELECT payload_hash, processed_at
+                FROM inbox_messages
+                WHERE consumer_name = ?
+                  AND message_id = ?
+                `,
+                [inbox.consumerName, inbox.messageId],
+                'all',
+              );
+
+              const previous = rows[0];
+
+              if (!previous) {
+                throw new InboxIncompleteError();
+              }
+
+              if (previous.payload_hash !== inbox.payloadHash) {
+                throw new InboxPayloadConflictError();
+              }
+
+              if (previous.processed_at !== null) {
+                throw new InboxAlreadyProcessedError();
+              }
+
+              throw new InboxIncompleteError();
+            }
+          }
+
           const walletEntity = await tx.findOne(
             WalletEntity,
             { id: walletId },
@@ -246,7 +310,24 @@ export class MikroOrmBetTransactionRunner
             },
           };
 
-          return callback(context);
+
+          const result = await callback(context);
+
+          if (inbox) {
+            await tx.execute(
+              `
+              UPDATE inbox_messages
+              SET processed_at = NOW()
+              WHERE consumer_name = ?
+                AND message_id = ?
+                AND processed_at IS NULL
+              `,
+              [inbox.consumerName, inbox.messageId],
+            );
+          }
+
+          return result;
+
         },
         { clear: true },
       );

@@ -3,8 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { Inject, Injectable } from '@nestjs/common';
 
-import { WalletLedgerEntry } from '../../../ledger/domain/wallet-ledger-entry.js';
 import { Money } from '../../../../shared/domain/money.js';
+import { WalletLedgerEntry } from '../../../ledger/domain/wallet-ledger-entry.js';
 import {
   WagerTransaction,
   WagerTransactionKind,
@@ -17,6 +17,7 @@ import {
   type BetIdentity,
   type BetResponseSnapshot,
   type BetTransactionRunner,
+  type InboxReceipt,
   type StoredBet,
 } from '../ports/bet-transaction-runner.js';
 
@@ -30,6 +31,7 @@ export interface ProcessBetInput {
   gameId: string;
   amount: string;
   currency: string;
+  inbox?: InboxReceipt;
 }
 
 export interface ProcessBetOutput extends BetResponseSnapshot {
@@ -72,7 +74,11 @@ export class ProcessBetUseCase {
         .digest('hex'),
     };
 
-    const existing = await this.runner.findExisting(identity);
+    // SQS messages must enter the transaction so that
+    // the Inbox is recorded atomically with the BET.
+    const existing = input.inbox
+      ? null
+      : await this.runner.findExisting(identity);
 
     if (existing) {
       return this.resolveExisting(existing, identity);
@@ -103,7 +109,8 @@ export class ProcessBetUseCase {
           const transaction = WagerTransaction.create({
             id: randomUUID(),
             providerId: input.providerId,
-            externalTransactionId: input.externalTransactionId,
+            externalTransactionId:
+            input.externalTransactionId,
             idempotencyKey: input.idempotencyKey,
             payloadHash: identity.payloadHash,
             walletId: input.walletId,
@@ -174,20 +181,41 @@ export class ProcessBetUseCase {
             idempotentReplay: false,
           };
         },
+        input.inbox,
       );
     } catch (error) {
-      // A concurrent transaction may have committed the
-      // same identity between our lookup and INSERT.
-      //
-      // The failed SQL transaction has already rolled back.
-      // Read again using a fresh transaction/EntityManager.
       if (error instanceof BetWriteConflictError) {
+        // Another transaction may have committed the
+        // same BET while this transaction was running.
         const committed = await this.runner.findExisting(
           identity,
         );
 
         if (committed) {
-          return this.resolveExisting(committed, identity);
+          if (!input.inbox) {
+            return this.resolveExisting(
+              committed,
+              identity,
+            );
+          }
+
+          // For SQS, replay must also register the Inbox
+          // receipt within a new SQL transaction.
+          return this.runner.withLockedWallet(
+            input.walletId,
+            identity,
+            async ({ existing }) => {
+              if (!existing) {
+                throw error;
+              }
+
+              return this.resolveExisting(
+                existing,
+                identity,
+              );
+            },
+            input.inbox,
+          );
         }
       }
 
@@ -227,7 +255,9 @@ export class ProcessBetUseCase {
 
     return {
       ...existing.snapshot,
-      balance: { ...existing.snapshot.balance },
+      balance: {
+        ...existing.snapshot.balance,
+      },
       idempotentReplay: true,
     };
   }
