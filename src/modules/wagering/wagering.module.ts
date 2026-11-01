@@ -59,8 +59,10 @@ import {
 import {
   MikroOrmRollbackTransactionRunner,
 } from './infrastructure/persistence/mikro-orm-rollback-transaction-runner.js';
+import { WageringQueryController } from './presentation/wagering-query.controller.js';
 
 @Module({
+  controllers: [WageringQueryController],
   providers: [
     ProcessBetUseCase,
     {

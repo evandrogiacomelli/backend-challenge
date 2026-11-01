@@ -10,9 +10,11 @@ import {
   MikroOrmWalletOpeningPersistence,
 } from './infrastructure/persistence/mikro-orm-wallet-opening.persistence.js';
 import { WalletController } from './presentation/wallet.controller.js';
+import { WalletQueryController } from './presentation/wallet-query-controller.js';
+import { WalletLedgerController } from './presentation/wallet-ledger.controller.js';
 
 @Module({
-  controllers: [WalletController],
+  controllers: [WalletController, WalletQueryController, WalletLedgerController],
   providers: [
     CreateWalletUseCase,
     {

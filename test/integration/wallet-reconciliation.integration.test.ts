@@ -35,6 +35,7 @@ import {
 import {
   MikroOrmBetTransactionRunner,
 } from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-bet-transaction-runner.js';
+import { WalletLedgerController } from '../../src/modules/wallet/presentation/wallet-ledger.controller.js';
 
 let orm: MikroORM;
 
@@ -271,4 +272,74 @@ describe('PostgreSQL Wallet Reconciliation', () => {
       WalletNotFoundError,
     );
   });
+
+
+  test(
+    'paginates wallet ledger in accounting sequence without duplicates',
+    async () => {
+      const wallet = await createWallet('100.00');
+
+      await bet(wallet, '10.00');
+      await bet(wallet, '20.00');
+
+      const controller = new WalletLedgerController(
+        orm.em.fork(),
+      );
+
+      const firstPage = await controller.getLedger(
+        wallet.id,
+        undefined,
+        '2',
+      );
+
+      expect(firstPage.items).toHaveLength(2);
+      expect(firstPage.limit).toBe(2);
+      expect(firstPage.nextCursor).toBe('2');
+
+      expect(
+        firstPage.items.map((item) => item.sequence),
+      ).toEqual(['1', '2']);
+
+      expect(
+        firstPage.items.map((item) => item.direction),
+      ).toEqual(['CREDIT', 'DEBIT']);
+
+      const secondPage = await controller.getLedger(
+        wallet.id,
+        firstPage.nextCursor!,
+        '2',
+      );
+
+      expect(secondPage.items).toHaveLength(1);
+      expect(secondPage.nextCursor).toBeNull();
+
+      expect(secondPage.items[0]?.sequence).toBe('3');
+      expect(secondPage.items[0]?.amount).toBe('20.00');
+      expect(secondPage.items[0]?.balanceAfter)
+        .toBe('70.00');
+
+      const allItems = [
+        ...firstPage.items,
+        ...secondPage.items,
+      ];
+
+      expect(allItems).toHaveLength(3);
+
+      expect(
+        new Set(allItems.map((item) => item.id)).size,
+      ).toBe(3);
+
+      expect(
+        allItems.map((item) => item.sequence),
+      ).toEqual(['1', '2', '3']);
+
+      const report =
+        await reconciler().reconcile(wallet.id);
+
+      expect(report.consistent).toBe(true);
+      expect(report.actualBalance).toBe('70.00');
+      expect(report.expectedBalance).toBe('70.00');
+    },
+  );
+
 });
