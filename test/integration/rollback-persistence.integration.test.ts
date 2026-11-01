@@ -51,6 +51,9 @@ import {
 import type {
   InboxReceipt,
 } from '../../src/modules/wagering/application/ports/bet-transaction-runner.js';
+import {
+  PostgresWalletReconciliationService
+} from '../../src/modules/reconciliation/infrastructure/postgres-wallet-reconciliation.service.js';
 
 let orm: MikroORM;
 
@@ -964,5 +967,123 @@ describe(
         expect(final.positions).toBe(3);
       },
     );
+
+
+    test(
+      'reconciles BET rollback with CREDIT',
+      async () => {
+        const wallet = await createWallet('100.00');
+        const original = await createBet(wallet, '30.00');
+
+        const rollbackResult =
+          await rollbackProcessor().execute(
+            rollback(original),
+          );
+
+        expect(rollbackResult.status).toBe(
+          WagerTransactionStatus.Processed,
+        );
+
+        const report =
+          await new PostgresWalletReconciliationService(
+            orm.em.fork(),
+          ).reconcile(wallet.id);
+
+        expect(report.consistent).toBe(true);
+        expect(report.actualBalance).toBe('100.00');
+        expect(report.expectedBalance).toBe('100.00');
+        expect(report.difference).toBe('0.00');
+
+        expect(report.ledgerEntries).toBe(3);
+        expect(report.actualVersion).toBe(3);
+        expect(report.expectedVersion).toBe(3);
+
+        expect(report.unexpectedLedgerEntries).toBe(0);
+        expect(report.missingLedgerEntries).toBe(0);
+        expect(report.invalidLedgerLinks).toBe(0);
+        expect(report.mismatchedAmounts).toBe(0);
+        expect(report.issues).toHaveLength(0);
+      },
+    );
+
+    test(
+      'reconciles WIN rollback with DEBIT',
+      async () => {
+        const wallet = await createWallet('100.00');
+        const original = await createWin(wallet, '30.00');
+
+        const rollbackResult =
+          await rollbackProcessor().execute(
+            rollback(original),
+          );
+
+        expect(rollbackResult.status).toBe(
+          WagerTransactionStatus.Processed,
+        );
+
+        const report =
+          await new PostgresWalletReconciliationService(
+            orm.em.fork(),
+          ).reconcile(wallet.id);
+
+        expect(report.consistent).toBe(true);
+        expect(report.actualBalance).toBe('100.00');
+        expect(report.expectedBalance).toBe('100.00');
+        expect(report.difference).toBe('0.00');
+
+        expect(report.ledgerEntries).toBe(3);
+        expect(report.actualVersion).toBe(3);
+        expect(report.expectedVersion).toBe(3);
+
+        expect(report.unexpectedLedgerEntries).toBe(0);
+        expect(report.missingLedgerEntries).toBe(0);
+        expect(report.invalidLedgerLinks).toBe(0);
+        expect(report.mismatchedAmounts).toBe(0);
+        expect(report.issues).toHaveLength(0);
+      },
+    );
+
+    test(
+      'reconciles REFUND rollback with DEBIT',
+      async () => {
+        const wallet = await createWallet('100.00');
+
+        const originalBet =
+          await createBet(wallet, '30.00');
+
+        const refund =
+          await createRefund(originalBet);
+
+        const rollbackResult =
+          await rollbackProcessor().execute(
+            rollback(refund),
+          );
+
+        expect(rollbackResult.status).toBe(
+          WagerTransactionStatus.Processed,
+        );
+
+        const report =
+          await new PostgresWalletReconciliationService(
+            orm.em.fork(),
+          ).reconcile(wallet.id);
+
+        expect(report.consistent).toBe(true);
+        expect(report.actualBalance).toBe('70.00');
+        expect(report.expectedBalance).toBe('70.00');
+        expect(report.difference).toBe('0.00');
+
+        expect(report.ledgerEntries).toBe(4);
+        expect(report.actualVersion).toBe(4);
+        expect(report.expectedVersion).toBe(4);
+
+        expect(report.unexpectedLedgerEntries).toBe(0);
+        expect(report.missingLedgerEntries).toBe(0);
+        expect(report.invalidLedgerLinks).toBe(0);
+        expect(report.mismatchedAmounts).toBe(0);
+        expect(report.issues).toHaveLength(0);
+      },
+    );
+
   },
 );
