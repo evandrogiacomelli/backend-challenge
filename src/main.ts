@@ -13,9 +13,9 @@ async function bootstrap(): Promise<void> {
     'SIGTERM',
   ]);
 
-  await app.listen(
-    Number(process.env.PORT ?? 3000),
-  );
+  const port = Number(process.env.PORT ?? 3000);
+
+  await app.listen(port);
 }
 
 await bootstrap();
