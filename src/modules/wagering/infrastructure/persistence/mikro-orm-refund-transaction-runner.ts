@@ -455,6 +455,94 @@ export class MikroOrmRefundTransactionRunner
             referenceBet,
             alreadyRefunded,
 
+
+            savePendingReference: async (
+              transaction: WagerTransaction,
+              snapshot: RefundResponseSnapshot,
+            ): Promise<void> => {
+              if (existing) {
+                throw new Error(
+                  'Cannot create a pending REFUND for an existing identity',
+                );
+              }
+
+              if (
+                transaction.status !==
+                WagerTransactionStatus.PendingReference
+              ) {
+                throw new Error(
+                  'REFUND must be PENDING_REFERENCE',
+                );
+              }
+
+              if (
+                transaction.walletId !== wallet.id ||
+                transaction.playerId !== wallet.playerId ||
+                transaction.money.currency !== wallet.currency
+              ) {
+                throw new Error(
+                  'Pending REFUND wallet context mismatch',
+                );
+              }
+
+              if (
+                !transaction.referenceExternalTransactionId
+              ) {
+                throw new Error(
+                  'Pending REFUND reference is missing',
+                );
+              }
+
+              await tx.execute(
+                `
+                INSERT INTO wager_transactions (
+                  id,
+                  provider_id,
+                  external_transaction_id,
+                  idempotency_key,
+                  payload_hash,
+                  wallet_id,
+                  player_id,
+                  round_id,
+                  game_id,
+                  kind,
+                  status,
+                  amount,
+                  currency,
+                  reference_external_transaction_id,
+                  response_snapshot,
+                  attempts,
+                  next_attempt_at,
+                  created_at
+                )
+                VALUES (
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  'REFUND',
+                  'PENDING_REFERENCE',
+                  ?, ?, ?, ?::jsonb,
+                  0,
+                  NOW(),
+                  NOW()
+                 )
+                `,
+                [
+                  transaction.id,
+                  identity.providerId,
+                  identity.externalTransactionId,
+                  identity.idempotencyKey,
+                  identity.payloadHash,
+                  wallet.id,
+                  wallet.playerId,
+                  transaction.roundId,
+                  transaction.gameId,
+                  transaction.money.toJSON().amount,
+                  transaction.money.currency,
+                  transaction.referenceExternalTransactionId,
+                  JSON.stringify(snapshot),
+                ],
+              );
+            },
+
             saveProcessed: async (
               transaction: WagerTransaction,
               snapshot: RefundResponseSnapshot,

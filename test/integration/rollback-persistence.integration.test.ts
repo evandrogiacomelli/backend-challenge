@@ -740,8 +740,8 @@ describe(
       },
     );
 
-    test(
-      'does not modify finances for an unknown reference',
+
+    test('persists unknown ROLLBACK reference without financial movement',
       async () => {
         const wallet = await createWallet();
 
@@ -749,8 +749,7 @@ describe(
           providerId: 'rollback-persistence-tests',
           externalTransactionId: randomUUID(),
           idempotencyKey: randomUUID(),
-          referenceExternalTransactionId:
-            randomUUID(),
+          referenceExternalTransactionId: randomUUID(),
           walletId: wallet.id,
           playerId: wallet.playerId,
           roundId: randomUUID(),
@@ -761,16 +760,67 @@ describe(
 
         const before = await inspect(wallet.id);
 
-        await expect(
-          rollbackProcessor().execute(input),
-        ).rejects.toBeInstanceOf(
-          RollbackReferenceNotFoundError,
+        const result =
+          await rollbackProcessor().execute(input);
+
+        expect(result.status).toBe(
+          WagerTransactionStatus.PendingReference,
         );
 
-        expect(await inspect(wallet.id))
-          .toEqual(before);
+        expect(result.balance.amount).toBe('100.00');
+        expect(result.walletVersion).toBe(1);
+        expect(result.idempotentReplay).toBe(false);
+
+        const after = await inspect(wallet.id);
+
+        // No wallet modification.
+        expect(after.wallet.balance_amount).toBe(
+          before.wallet.balance_amount,
+        );
+
+        expect(after.wallet.version).toBe(
+          before.wallet.version,
+        );
+
+        // No new processed ROLLBACK.
+        expect(after.rollbacks).toBe(before.rollbacks);
+
+        // No credit or debit in ledger.
+        expect(after.credits).toBe(before.credits);
+        expect(after.debits).toBe(before.debits);
+
+        // No processed event or ledger position.
+        expect(after.events).toBe(before.events);
+        expect(after.positions).toBe(before.positions);
+
+        // Verify actual PostgreSQL persistence.
+        const rows = await orm.em.fork().execute<
+          Array<{
+            status: string;
+            reference_transaction_id: string | null;
+          }>
+        >(
+          `
+            SELECT
+              status,
+              reference_transaction_id
+            FROM wager_transactions
+            WHERE id = ?
+          `,
+              [result.transactionId],
+              'all',
+        );
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.status).toBe(
+          'PENDING_REFERENCE',
+        );
+        expect(
+          rows[0]!.reference_transaction_id,
+        ).toBeNull();
       },
     );
+
 
     test(
       'does not ROLLBACK a BET that already has a processed REFUND',

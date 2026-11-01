@@ -165,11 +165,37 @@ function harness(
       _referenceExternalTransactionId,
       callback,
     ) {
+
       return callback({
         wallet,
         existing,
         referenceTransaction: original,
         alreadyReversed,
+
+        async savePendingReference(
+          transaction,
+          snapshot,
+        ) {
+          expect(transaction.status).toBe(
+            WagerTransactionStatus.PendingReference,
+          );
+
+          expect(snapshot.status).toBe(
+            WagerTransactionStatus.PendingReference,
+          );
+
+          // Persist the pending identity in the mock.
+          // No wallet movement or ledger entry.
+          existing = {
+            externalTransactionId:
+            identity.externalTransactionId,
+            idempotencyKey:
+            identity.idempotencyKey,
+            payloadHash:
+            identity.payloadHash,
+            snapshot,
+          };
+        },
 
         async saveProcessed(
           transaction,
@@ -311,21 +337,6 @@ describe('ProcessRollbackUseCase', () => {
     expect(setup.saves).toBe(0);
   });
 
-  test('rejects unknown reference', async () => {
-    const value = input();
-    const setup = harness(value);
-
-    setup.setReference(null);
-
-    await expect(
-      setup.useCase.execute(value),
-    ).rejects.toBeInstanceOf(
-      RollbackReferenceNotFoundError,
-    );
-
-    expect(setup.saves).toBe(0);
-  });
-
   test('rejects reference to LOSS', async () => {
     const value = input();
     const setup = harness(value);
@@ -424,6 +435,41 @@ describe('ProcessRollbackUseCase', () => {
       RollbackInvalidReferenceError,
     );
 
+    expect(setup.saves).toBe(0);
+  });
+
+
+
+  test('persists ROLLBACK as pending without financial movement', async () => {
+    const value = input();
+    const setup = harness(value);
+
+    setup.setReference(null);
+
+    const result = await setup.useCase.execute(value);
+
+    expect(result.status).toBe(
+      WagerTransactionStatus.PendingReference,
+    );
+
+    expect(result.balance.amount).toBe('70.00');
+    expect(result.walletVersion).toBe(2);
+    expect(result.idempotentReplay).toBe(false);
+
+    expect(setup.saves).toBe(0);
+    expect(setup.wallet.version).toBe(2);
+
+    const replay = await setup.useCase.execute(value);
+
+    expect(replay.transactionId).toBe(
+      result.transactionId,
+    );
+
+    expect(replay.status).toBe(
+      WagerTransactionStatus.PendingReference,
+    );
+
+    expect(replay.idempotentReplay).toBe(true);
     expect(setup.saves).toBe(0);
   });
 });

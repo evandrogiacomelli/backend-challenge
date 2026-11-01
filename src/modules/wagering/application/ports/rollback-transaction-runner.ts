@@ -88,6 +88,11 @@ export interface LockedRollbackContext {
     snapshot: RollbackResponseSnapshot,
     details: RollbackPersistenceDetails,
   ): Promise<void>;
+
+  savePendingReference(
+    transaction: WagerTransaction,
+    snapshot: RollbackResponseSnapshot,
+  ): Promise<void>;
 }
 
 export interface RollbackTransactionRunner {

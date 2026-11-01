@@ -487,8 +487,8 @@ describe('PostgreSQL REFUND transactional persistence', () => {
     30000,
   );
 
-  test(
-    'does not modify finances when referenced BET does not exist',
+
+  test('does not modify finances when referenced BET does not exist',
     async () => {
       const wallet = await createWallet();
 
@@ -496,10 +496,7 @@ describe('PostgreSQL REFUND transactional persistence', () => {
         providerId: 'refund-persistence-tests',
         externalTransactionId: randomUUID(),
         idempotencyKey: randomUUID(),
-
-        referenceExternalTransactionId:
-          randomUUID(),
-
+        referenceExternalTransactionId: randomUUID(),
         walletId: wallet.id,
         playerId: wallet.playerId,
         roundId: randomUUID(),
@@ -510,20 +507,106 @@ describe('PostgreSQL REFUND transactional persistence', () => {
 
       const before = await inspect(wallet.id);
 
-      await expect(
-        processor().execute(input),
-      ).rejects.toBeInstanceOf(
-        RefundReferenceNotFoundError,
+      // A missing BET is now persisted as PENDING_REFERENCE.
+      const result = await processor().execute(input);
+
+      expect(result.status).toBe(
+        WagerTransactionStatus.PendingReference,
+      );
+
+      expect(result.idempotentReplay).toBe(false);
+
+      expect(result.balance.amount).toBe('100.00');
+
+      expect(result.walletVersion).toBe(
+        before.wallet.version,
       );
 
       const after = await inspect(wallet.id);
 
-      expect(after).toEqual(before);
-      expect(after.refunds).toBe(0);
-      expect(after.credits).toBe(0);
-      expect(after.events).toBe(0);
+      // Wallet balance and version must remain unchanged.
+      expect(after.wallet.balance_amount).toBe(
+        before.wallet.balance_amount,
+      );
+
+      expect(after.wallet.version).toBe(
+        before.wallet.version,
+      );
+
+      // No processed REFUND or financial side effects.
+      expect(after.refunds).toBe(before.refunds);
+      expect(after.credits).toBe(before.credits);
+      expect(after.events).toBe(before.events);
+      expect(after.positions).toBe(before.positions);
+
+      // The pending operation must be persisted in PostgreSQL.
+      const rows = await orm.em.fork().execute<
+        Array<{
+          kind: string;
+          status: string;
+          reference_external_transaction_id: string;
+          reference_transaction_id: string | null;
+          processed_at: Date | null;
+          attempts: number;
+        }>
+      >(
+        `
+          SELECT
+            kind,
+            status,
+            reference_external_transaction_id,
+            reference_transaction_id,
+            processed_at,
+            attempts
+          FROM wager_transactions
+          WHERE id = ?
+        `,
+        [result.transactionId],
+        'all',
+      );
+
+      expect(rows).toHaveLength(1);
+
+      const pending = rows[0]!;
+
+      expect(pending.kind).toBe('REFUND');
+      expect(pending.status).toBe('PENDING_REFERENCE');
+
+      expect(
+        pending.reference_external_transaction_id,
+      ).toBe(input.referenceExternalTransactionId);
+
+      expect(pending.reference_transaction_id).toBeNull();
+      expect(pending.processed_at).toBeNull();
+      expect(pending.attempts).toBe(0);
+
+      // Replaying the same request must not create
+      // another pending transaction.
+      const replay = await processor().execute(input);
+
+      expect(replay.transactionId).toBe(
+        result.transactionId,
+      );
+
+      expect(replay.idempotentReplay).toBe(true);
+
+      const final = await inspect(wallet.id);
+
+      expect(final.wallet.balance_amount).toBe(
+        before.wallet.balance_amount,
+      );
+
+      expect(final.wallet.version).toBe(
+        before.wallet.version,
+      );
+
+      expect(final.refunds).toBe(before.refunds);
+      expect(final.credits).toBe(before.credits);
+      expect(final.events).toBe(before.events);
+      expect(final.positions).toBe(before.positions);
     },
   );
+
 
   test(
     'rejects a REFUND with a different amount',

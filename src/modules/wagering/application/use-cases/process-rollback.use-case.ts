@@ -152,15 +152,45 @@ export class ProcessRollbackUseCase {
             );
           }
 
-          const reference =
-            context.referenceTransaction;
+
+          const transaction = WagerTransaction.create({
+            id: randomUUID(),
+            providerId: input.providerId,
+            externalTransactionId:
+            input.externalTransactionId,
+            idempotencyKey: input.idempotencyKey,
+            payloadHash: identity.payloadHash,
+            walletId: input.walletId,
+            playerId: input.playerId,
+            roundId: input.roundId,
+            gameId: input.gameId,
+            kind: WagerTransactionKind.Rollback,
+            money,
+            referenceExternalTransactionId:
+            input.referenceExternalTransactionId,
+          });
+
+          const reference = context.referenceTransaction;
 
           if (!reference) {
-            // Commit 25 will handle persistent
-            // PENDING_REFERENCE transactions.
-            // Never mutate a wallet without
-            // a valid committed reference.
-            throw new RollbackReferenceNotFoundError();
+            transaction.markPendingReference();
+
+            const snapshot: RollbackResponseSnapshot = {
+              transactionId: transaction.id,
+              status: WagerTransactionStatus.PendingReference,
+              balance: wallet.balance.toJSON(),
+              walletVersion: wallet.version,
+            };
+
+            await context.savePendingReference(
+              transaction,
+              snapshot,
+            );
+
+            return {
+              ...snapshot,
+              idempotentReplay: false,
+            };
           }
 
           this.validateReference(
@@ -172,28 +202,6 @@ export class ProcessRollbackUseCase {
           if (context.alreadyReversed) {
             throw new RollbackAlreadyAppliedError();
           }
-
-          const transaction = WagerTransaction.create({
-            id: randomUUID(),
-            providerId: input.providerId,
-
-            externalTransactionId:
-            input.externalTransactionId,
-
-            idempotencyKey: input.idempotencyKey,
-            payloadHash: identity.payloadHash,
-
-            walletId: input.walletId,
-            playerId: input.playerId,
-            roundId: input.roundId,
-            gameId: input.gameId,
-
-            kind: WagerTransactionKind.Rollback,
-            money,
-
-            referenceExternalTransactionId:
-            input.referenceExternalTransactionId,
-          });
 
           // The domain determines the correct
           // direction based on the original wager.

@@ -165,15 +165,50 @@ export class ProcessRefundUseCase {
             );
           }
 
+
+          const transaction = WagerTransaction.create({
+            id: randomUUID(),
+            providerId: input.providerId,
+            externalTransactionId:
+            input.externalTransactionId,
+            idempotencyKey: input.idempotencyKey,
+            referenceExternalTransactionId:
+            input.referenceExternalTransactionId,
+            payloadHash: identity.payloadHash,
+            walletId: input.walletId,
+            playerId: input.playerId,
+            roundId: input.roundId,
+            gameId: input.gameId,
+            kind: WagerTransactionKind.Refund,
+            money,
+          });
+
           const reference = context.referenceBet;
 
           if (!reference) {
-            // Commit 25 will handle
-            // PENDING_REFERENCE persistently.
-            // Never credit an unknown BET.
-            throw new RefundReferenceNotFoundError();
+            // Persist the operation without moving money.
+            transaction.markPendingReference();
+
+            const snapshot: RefundResponseSnapshot = {
+              transactionId: transaction.id,
+              status: WagerTransactionStatus.PendingReference,
+              balance: wallet.balance.toJSON(),
+              walletVersion: wallet.version,
+            };
+
+            await context.savePendingReference(
+              transaction,
+              snapshot,
+            );
+
+            return {
+              ...snapshot,
+              idempotentReplay: false,
+            };
           }
 
+// Reference exists: preserve the existing
+// financial validation and processing.
           this.validateReference(
             reference,
             input,
@@ -184,34 +219,6 @@ export class ProcessRefundUseCase {
             throw new RefundAlreadyAppliedError();
           }
 
-          const transaction =
-            WagerTransaction.create({
-              id: randomUUID(),
-
-              providerId: input.providerId,
-
-              externalTransactionId:
-              input.externalTransactionId,
-
-              idempotencyKey:
-              input.idempotencyKey,
-
-              referenceExternalTransactionId:
-              input.referenceExternalTransactionId,
-
-              payloadHash:
-              identity.payloadHash,
-
-              walletId: input.walletId,
-              playerId: input.playerId,
-              roundId: input.roundId,
-              gameId: input.gameId,
-
-              kind:
-              WagerTransactionKind.Refund,
-
-              money,
-            });
 
           // Credit the wallet while the PostgreSQL
           // adapter holds SELECT FOR UPDATE.

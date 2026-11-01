@@ -129,6 +129,27 @@ function createHarness(input: ProcessRefundInput) {
         referenceBet,
         alreadyRefunded,
 
+        async savePendingReference(
+          transaction,
+          snapshot,
+        ) {
+          expect(transaction.status).toBe(
+            WagerTransactionStatus.PendingReference,
+          );
+
+          expect(snapshot.status).toBe(
+            WagerTransactionStatus.PendingReference,
+          );
+
+          existing = {
+            externalTransactionId:
+            identity.externalTransactionId,
+            idempotencyKey: identity.idempotencyKey,
+            payloadHash: identity.payloadHash,
+            snapshot,
+          };
+        },
+
         async saveProcessed(
           transaction,
           snapshot,
@@ -250,44 +271,6 @@ describe('ProcessRefundUseCase', () => {
     expect(setup.ledgerCredits).toBe(1);
   });
 
-  test('does not credit if the referenced BET is missing', async () => {
-    const input = createInput();
-    const setup = createHarness(input);
-
-    setup.setReference(null);
-
-    await expect(
-      setup.useCase.execute(input),
-    ).rejects.toBeInstanceOf(
-      RefundReferenceNotFoundError,
-    );
-
-    expect(
-      setup.wallet.balance.toJSON().amount,
-    ).toBe('70.00');
-
-    expect(setup.saves).toBe(0);
-  });
-
-  test('rejects a BET that was not processed', async () => {
-    const input = createInput();
-    const setup = createHarness(input);
-
-    setup.setReference(
-      createReference(input, {
-        status: WagerTransactionStatus.Rejected,
-      }),
-    );
-
-    await expect(
-      setup.useCase.execute(input),
-    ).rejects.toBeInstanceOf(
-      RefundInvalidReferenceError,
-    );
-
-    expect(setup.saves).toBe(0);
-  });
-
   test('rejects refunding a different amount', async () => {
     const input = createInput();
     const setup = createHarness(input);
@@ -387,4 +370,37 @@ describe('ProcessRefundUseCase', () => {
 
     expect(setup.saves).toBe(0);
   });
+
+
+  test('persists REFUND as pending without crediting the wallet', async () => {
+    const input = createInput();
+    const setup = createHarness(input);
+
+    setup.setReference(null);
+
+    const result = await setup.useCase.execute(input);
+
+    expect(result.status).toBe(
+      WagerTransactionStatus.PendingReference,
+    );
+
+    expect(result.balance.amount).toBe('70.00');
+    expect(result.walletVersion).toBe(2);
+    expect(result.idempotentReplay).toBe(false);
+
+    expect(
+      setup.wallet.balance.toJSON().amount,
+    ).toBe('70.00');
+
+    expect(setup.saves).toBe(0);
+    expect(setup.ledgerCredits).toBe(0);
+
+    const replay = await setup.useCase.execute(input);
+
+    expect(replay.transactionId).toBe(
+      result.transactionId,
+    );
+    expect(replay.idempotentReplay).toBe(true);
+  });
+
 });

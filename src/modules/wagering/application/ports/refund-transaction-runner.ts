@@ -87,6 +87,11 @@ export interface LockedRefundContext {
     details: RefundPersistenceDetails,
     ledger: WalletLedgerEntry,
   ): Promise<void>;
+
+  savePendingReference(
+    transaction: WagerTransaction,
+    snapshot: RefundResponseSnapshot,
+  ): Promise<void>;
 }
 
 export interface RefundTransactionRunner {
