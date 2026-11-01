@@ -12,6 +12,7 @@ import { OutboxModule } from './modules/messaging/outbox/outbox.module.js';
 import { WagerInboxModule } from './modules/messaging/inbox/wager-inbox.module.js';
 import { PendingReferenceModule } from './modules/wagering/pending-reference.module.js';
 import { ObservabilityModule } from './modules/observability/observability.module.js';
+import { HealthModule } from './modules/health/health.module.js';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { ObservabilityModule } from './modules/observability/observability.modul
     OutboxModule,
     WagerInboxModule,
     PendingReferenceModule,
+    HealthModule
   ],
   controllers: [AppController],
   providers: [AppService],

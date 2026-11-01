@@ -36,6 +36,10 @@ import {
   MikroOrmBetTransactionRunner,
 } from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-bet-transaction-runner.js';
 import { WalletLedgerController } from '../../src/modules/wallet/presentation/wallet-ledger.controller.js';
+import {
+  WalletReconciliationController
+} from '../../src/modules/wallet/presentation/wallet-reconciliation.controller.js';
+import { NotFoundException } from '@nestjs/common';
 
 let orm: MikroORM;
 
@@ -339,6 +343,62 @@ describe('PostgreSQL Wallet Reconciliation', () => {
       expect(report.consistent).toBe(true);
       expect(report.actualBalance).toBe('70.00');
       expect(report.expectedBalance).toBe('70.00');
+    },
+  );
+
+
+  test(
+    'reconciles a wallet through the HTTP controller',
+    async () => {
+      const wallet = await createWallet('100.00');
+
+      await bet(wallet, '30.00');
+
+      const controller =
+        new WalletReconciliationController(
+          new PostgresWalletReconciliationService(
+            orm.em.fork(),
+          ),
+        );
+
+      const result = await controller.reconcile(
+        wallet.id,
+      );
+
+      expect(result.walletId).toBe(wallet.id);
+      expect(result.consistent).toBe(true);
+
+      expect(result.actualBalance).toBe('70.00');
+      expect(result.expectedBalance).toBe('70.00');
+      expect(result.difference).toBe('0.00');
+
+      expect(result.actualVersion).toBe(2);
+      expect(result.expectedVersion).toBe(2);
+
+      expect(result.ledgerEntries).toBe(2);
+      expect(result.missingLedgerEntries).toBe(0);
+      expect(result.unexpectedLedgerEntries).toBe(0);
+      expect(result.invalidLedgerLinks).toBe(0);
+      expect(result.mismatchedAmounts).toBe(0);
+      expect(result.issues).toHaveLength(0);
+    },
+  );
+
+  test(
+    'returns HTTP 404 for a nonexistent wallet',
+    async () => {
+      const controller =
+        new WalletReconciliationController(
+          new PostgresWalletReconciliationService(
+            orm.em.fork(),
+          ),
+        );
+
+      await expect(
+        controller.reconcile(randomUUID()),
+      ).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
     },
   );
 

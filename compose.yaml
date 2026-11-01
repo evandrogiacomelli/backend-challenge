@@ -1,35 +1,53 @@
-
 services:
   postgres:
     image: postgres:17-alpine
     container_name: wagering-postgres
     restart: unless-stopped
+
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
+
     ports:
       - "127.0.0.1:5432:5432"
+
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB
       interval: 5s
       timeout: 3s
       retries: 10
 
-
   localstack:
     image: localstack/localstack:4.14.0
     restart: unless-stopped
+
     ports:
       - "127.0.0.1:4566:4566"
+
     environment:
       SERVICES: sqs
       AWS_DEFAULT_REGION: us-east-1
       SQS_ENDPOINT_STRATEGY: path
+      PERSISTENCE: "1"
+
     volumes:
       - localstack-data:/var/lib/localstack
+      - ./localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:4566/_localstack/health > /dev/null
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
 volumes:
   postgres_data:
