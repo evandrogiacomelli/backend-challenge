@@ -10,6 +10,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
   Post,
+  Res,
 } from '@nestjs/common';
 
 import {
@@ -411,6 +412,47 @@ function handleBusinessError(
   throw error;
 }
 
+/** Minimal response adapter for @Res({ passthrough: true }). */
+interface HttpStatusWriter {
+  status(code: number): unknown;
+}
+
+interface FinancialResult {
+  status: string;
+}
+
+/** Preserve the original financial result body, including replay snapshots. */
+function returnFinancialResult<T extends FinancialResult>(
+  result: T,
+  response: HttpStatusWriter,
+): T {
+  switch (result.status) {
+    case 'PROCESSED':
+      response.status(HttpStatus.OK);
+      break;
+
+    case 'PENDING':
+    case 'PENDING_REFERENCE':
+      response.status(HttpStatus.ACCEPTED);
+      break;
+
+    case 'REJECTED':
+      response.status(HttpStatus.UNPROCESSABLE_ENTITY);
+      break;
+
+    case 'FAILED':
+      response.status(HttpStatus.INTERNAL_SERVER_ERROR);
+      break;
+
+    default:
+      throw new InternalServerErrorException(
+        'Unexpected financial transaction status',
+      );
+  }
+
+  return result;
+}
+
 @Controller('wagering/transactions')
 export class WageringCommandController {
   constructor(
@@ -429,6 +471,9 @@ export class WageringCommandController {
 
     @Body()
     rawBody: unknown,
+
+    @Res({ passthrough: true })
+    response: HttpStatusWriter,
   ) {
     if (
       typeof idempotencyKeyRaw !== 'string' ||
@@ -462,30 +507,45 @@ export class WageringCommandController {
     try {
       switch (command.kind) {
         case 'BET':
-          return await this.bet.execute(common);
+          return returnFinancialResult(
+            await this.bet.execute(common),
+            response,
+          );
 
         case 'WIN':
-          return await this.win.execute(common);
+          return returnFinancialResult(
+            await this.win.execute(common),
+            response,
+          );
 
         case 'LOSS':
-          return await this.loss.execute(common);
+          return returnFinancialResult(
+            await this.loss.execute(common),
+            response,
+          );
 
         case 'REFUND':
-          return await this.refund.execute({
-            ...common,
-            referenceExternalTransactionId:
-              command.referenceExternalTransactionId!,
-          });
+          return returnFinancialResult(
+            await this.refund.execute({
+              ...common,
+              referenceExternalTransactionId:
+                command.referenceExternalTransactionId!,
+            }),
+            response,
+          );
 
         case 'ROLLBACK':
-          return await this.rollback.execute({
-            ...common,
-            referenceExternalTransactionId:
-              command.referenceExternalTransactionId!,
-          });
+          return returnFinancialResult(
+            await this.rollback.execute({
+              ...common,
+              referenceExternalTransactionId:
+                command.referenceExternalTransactionId!,
+            }),
+            response,
+          );
       }
     } catch (error) {
-      handleBusinessError(error);
+      return handleBusinessError(error);
     }
   }
 }

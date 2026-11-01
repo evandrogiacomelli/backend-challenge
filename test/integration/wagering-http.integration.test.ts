@@ -401,12 +401,12 @@ describe('Real HTTP wagering integration', () => {
       const first = await postWager(input, key);
       const replay = await postWager(input, key);
 
-      expect(first.status).toBe(200);
+      expect(first.status).toBe(422);
       expect(first.body.status).toBe('REJECTED');
       expect(first.body.failureCode)
         .toBe('INSUFFICIENT_FUNDS');
 
-      expect(replay.status).toBe(200);
+      expect(replay.status).toBe(422);
       expect(replay.body.idempotentReplay).toBe(true);
       expect(replay.body.transactionId)
         .toBe(first.body.transactionId);
@@ -441,7 +441,7 @@ describe('Real HTTP wagering integration', () => {
 
       const result = await postWager(input);
 
-      expect(result.status).toBe(200);
+      expect(result.status).toBe(202);
       expect(result.body.status)
         .toBe('PENDING_REFERENCE');
 
@@ -626,4 +626,69 @@ describe('Real HTTP wagering integration', () => {
         .toBe('70.00');
     },
   );
+
+
+  test(
+    'returns 422 consistently for rejected transactions and their replays',
+    async () => {
+      const wallet = await createWallet('10.00');
+      const input = wagerBody(wallet, 'BET', '50.00');
+      const key = randomUUID();
+
+      const first = await postWager(input, key);
+      const replay = await postWager(input, key);
+
+      expect(first.status).toBe(422);
+      expect(first.body.status).toBe('REJECTED');
+      expect(first.body.failureCode)
+        .toBe('INSUFFICIENT_FUNDS');
+
+      expect(replay.status).toBe(422);
+      expect(replay.body.idempotentReplay).toBe(true);
+      expect(replay.body.transactionId)
+        .toBe(first.body.transactionId);
+
+      const stored = await request<WalletResponse>(
+        `/wallets/${wallet.id}`,
+      );
+
+      expect(stored.body.balance.amount).toBe('10.00');
+      expect(stored.body.version).toBe(1);
+    },
+  );
+
+  test(
+    'returns 202 for a pending reference and its replay',
+    async () => {
+      const wallet = await createWallet();
+      const input = {
+        ...wagerBody(wallet, 'REFUND'),
+        referenceExternalTransactionId:
+          randomUUID(),
+      };
+
+      const key = randomUUID();
+
+      const first = await postWager(input, key);
+      const replay = await postWager(input, key);
+
+      expect(first.status).toBe(202);
+      expect(first.body.status)
+        .toBe('PENDING_REFERENCE');
+
+      expect(replay.status).toBe(202);
+      expect(replay.body.idempotentReplay).toBe(true);
+      expect(replay.body.transactionId)
+        .toBe(first.body.transactionId);
+
+      const stored = await request<WalletResponse>(
+        `/wallets/${wallet.id}`,
+      );
+
+      expect(stored.body.balance.amount)
+        .toBe('100.00');
+      expect(stored.body.version).toBe(1);
+    },
+  );
+
 });
