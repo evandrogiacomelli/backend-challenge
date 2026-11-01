@@ -1,9 +1,12 @@
 import {
   Injectable,
   Logger,
+  type BeforeApplicationShutdown,
 } from '@nestjs/common';
 
-import { Interval } from '@nestjs/schedule';
+import {
+  Interval,
+} from '@nestjs/schedule';
 
 import {
   RecoverPendingReferencesUseCase,
@@ -11,12 +14,18 @@ import {
 } from '../../application/use-cases/recover-pending-references.use-case.js';
 
 @Injectable()
-export class PendingReferenceWorker {
+export class PendingReferenceWorker
+  implements BeforeApplicationShutdown {
+
   private readonly logger = new Logger(
     PendingReferenceWorker.name,
   );
 
-  private running = false;
+  private shuttingDown = false;
+
+  private inFlight:
+    Promise<RecoverPendingReferencesResult | null>
+    | null = null;
 
   constructor(
     private readonly recoverPendingReferences:
@@ -25,6 +34,10 @@ export class PendingReferenceWorker {
 
   @Interval(5_000)
   async tick(): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
     if (
       process.env.PENDING_REFERENCE_WORKER_ENABLED ===
       'false'
@@ -36,21 +49,38 @@ export class PendingReferenceWorker {
   }
 
   /**
-   * Also exposed for deterministic integration tests.
+   * Exposed for deterministic integration tests.
    *
-   * Multiple NestJS instances may run concurrently.
-   * Cross-instance coordination is handled by
-   * PostgreSQL, not this in-memory flag.
+   * Concurrent NestJS instances coordinate using
+   * PostgreSQL leases and row locking.
    */
   async runOnce(): Promise<
     RecoverPendingReferencesResult | null
   > {
-    if (this.running) {
+    if (this.shuttingDown) {
       return null;
     }
 
-    this.running = true;
+    if (this.inFlight !== null) {
+      return null;
+    }
 
+    const task = this.processBatch();
+
+    this.inFlight = task;
+
+    try {
+      return await task;
+    } finally {
+      if (this.inFlight === task) {
+        this.inFlight = null;
+      }
+    }
+  }
+
+  private async processBatch(): Promise<
+    RecoverPendingReferencesResult | null
+  > {
     try {
       const result =
         await this.recoverPendingReferences.execute({
@@ -65,7 +95,8 @@ export class PendingReferenceWorker {
 
         for (const failure of result.failures) {
           this.logger.error(
-            `Transaction ${failure.transactionId}: ${failure.message}`,
+            `Transaction ${failure.transactionId}: ` +
+            failure.message,
           );
         }
       }
@@ -96,12 +127,36 @@ export class PendingReferenceWorker {
           : String(error),
       );
 
-      // The worker does not delete or acknowledge
-      // pending operations after a failure.
+      // Never delete pending work on failure.
       // PostgreSQL leases eventually expire.
       return null;
-    } finally {
-      this.running = false;
     }
+  }
+
+  async beforeApplicationShutdown(
+    signal?: string,
+  ): Promise<void> {
+    this.shuttingDown = true;
+
+    const active = this.inFlight;
+
+    if (active === null) {
+      this.logger.log(
+        `Shutdown (${signal ?? 'manual'}): ` +
+        'no active pending recovery',
+      );
+      return;
+    }
+
+    this.logger.log(
+      `Shutdown (${signal ?? 'manual'}): ` +
+      'waiting for active pending recovery',
+    );
+
+    await active;
+
+    this.logger.log(
+      'Active pending recovery finished',
+    );
   }
 }

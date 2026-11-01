@@ -1,6 +1,7 @@
 import {
   Injectable,
   Logger,
+  type BeforeApplicationShutdown,
 } from '@nestjs/common';
 
 import {
@@ -12,12 +13,16 @@ import {
 } from './sqs-wager.consumer.js';
 
 @Injectable()
-export class SqsWagerWorker {
+export class SqsWagerWorker
+  implements BeforeApplicationShutdown {
+
   private readonly logger = new Logger(
     SqsWagerWorker.name,
   );
 
-  private running = false;
+  private shuttingDown = false;
+
+  private inFlight: Promise<void> | null = null;
 
   constructor(
     private readonly consumer: SqsWagerConsumer,
@@ -25,6 +30,10 @@ export class SqsWagerWorker {
 
   @Interval(1_000)
   async runOnce(): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
     if (
       process.env.SQS_WAGER_WORKER_ENABLED !==
       'true'
@@ -32,15 +41,25 @@ export class SqsWagerWorker {
       return;
     }
 
-    // An SQS long poll can take up to 5 seconds.
-    // Do not start another poll while one is active
-    // in this NestJS instance.
-    if (this.running) {
+    // Never overlap polling inside one instance.
+    if (this.inFlight !== null) {
       return;
     }
 
-    this.running = true;
+    const task = this.poll();
 
+    this.inFlight = task;
+
+    try {
+      await task;
+    } finally {
+      if (this.inFlight === task) {
+        this.inFlight = null;
+      }
+    }
+  }
+
+  private async poll(): Promise<void> {
     try {
       const result =
         await this.consumer.pollOnce();
@@ -62,8 +81,35 @@ export class SqsWagerWorker {
           ? error.stack
           : String(error),
       );
-    } finally {
-      this.running = false;
     }
+  }
+
+  async beforeApplicationShutdown(
+    signal?: string,
+  ): Promise<void> {
+    this.shuttingDown = true;
+
+    const active = this.inFlight;
+
+    if (active === null) {
+      this.logger.log(
+        `Shutdown (${signal ?? 'manual'}): ` +
+        'no active SQS polling',
+      );
+      return;
+    }
+
+    this.logger.log(
+      `Shutdown (${signal ?? 'manual'}): ` +
+      'waiting for active SQS processing',
+    );
+
+    // The existing consumer decides whether an ACK is
+    // safe. The worker must not acknowledge anything.
+    await active;
+
+    this.logger.log(
+      'Active SQS processing finished',
+    );
   }
 }
