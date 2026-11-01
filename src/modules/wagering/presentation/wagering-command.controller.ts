@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Body,
   ConflictException,
   Controller,
   Headers,
@@ -9,7 +10,6 @@ import {
   InternalServerErrorException,
   NotFoundException,
   Post,
-  Body,
 } from '@nestjs/common';
 
 import {
@@ -55,16 +55,9 @@ interface WagerCommand {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// PostgreSQL numeric(19,2): up to 17 integer digits.
+// PostgreSQL numeric(19,2): at most 17 integer digits.
 const AMOUNT_PATTERN =
   /^(?:0|[1-9]\d{0,16})\.\d{2}$/;
-
-const IDENTIFIER_FIELDS = [
-  'providerId',
-  'externalTransactionId',
-  'roundId',
-  'gameId',
-] as const;
 
 const ALLOWED_FIELDS = new Set([
   'kind',
@@ -74,15 +67,33 @@ const ALLOWED_FIELDS = new Set([
   'playerId',
   'roundId',
   'gameId',
+  'money',
+  // Legacy representation, temporarily supported.
   'amount',
   'currency',
   'referenceExternalTransactionId',
 ]);
 
+const MONEY_FIELDS = new Set([
+  'amount',
+  'currency',
+]);
+
+function isRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  );
+}
+
 function requiredString(
   body: Record<string, unknown>,
   field: string,
   maxLength = 255,
+  label = field,
 ): string {
   const value = body[field];
 
@@ -94,25 +105,120 @@ function requiredString(
     value.trim().length === 0
   ) {
     throw new BadRequestException(
-      `${field} must be a non-empty string of at most ${maxLength} characters`,
+      `${label} must be a non-empty string of at most ${maxLength} characters`,
     );
   }
 
   return value;
 }
 
-function parseCommand(raw: unknown): WagerCommand {
+function parseMoney(
+  body: Record<string, unknown>,
+): {
+  amount: string;
+  currency: string;
+} {
+  const hasMoney = Object.hasOwn(
+    body,
+    'money',
+  );
+
+  const hasFlatAmount = Object.hasOwn(
+    body,
+    'amount',
+  );
+
+  const hasFlatCurrency = Object.hasOwn(
+    body,
+    'currency',
+  );
+
   if (
-    raw === null ||
-    typeof raw !== 'object' ||
-    Array.isArray(raw)
+    hasMoney &&
+    (hasFlatAmount || hasFlatCurrency)
   ) {
+    throw new BadRequestException(
+      'Use money.amount and money.currency; do not mix money with top-level amount or currency',
+    );
+  }
+
+  if (
+    !hasMoney &&
+    !hasFlatAmount &&
+    !hasFlatCurrency
+  ) {
+    throw new BadRequestException(
+      'money is required',
+    );
+  }
+
+  let source: Record<string, unknown>;
+
+  if (hasMoney) {
+    if (!isRecord(body.money)) {
+      throw new BadRequestException(
+        'money must be a JSON object',
+      );
+    }
+
+    source = body.money;
+
+    for (const field of Object.keys(source)) {
+      if (!MONEY_FIELDS.has(field)) {
+        throw new BadRequestException(
+          `Unknown money field: ${field}`,
+        );
+      }
+    }
+  } else {
+    source = body;
+  }
+
+  const amount = requiredString(
+    source,
+    'amount',
+    20,
+    hasMoney ? 'money.amount' : 'amount',
+  );
+
+  if (
+    !AMOUNT_PATTERN.test(amount) ||
+    amount === '0.00'
+  ) {
+    throw new BadRequestException(
+      'money.amount must be a positive decimal string with exactly two decimal places',
+    );
+  }
+
+  const currency = requiredString(
+    source,
+    'currency',
+    3,
+    hasMoney ? 'money.currency' : 'currency',
+  );
+
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new BadRequestException(
+      'money.currency must be a three-letter uppercase ISO currency code',
+    );
+  }
+
+  return {
+    amount,
+    currency,
+  };
+}
+
+function parseCommand(
+  raw: unknown,
+): WagerCommand {
+  if (!isRecord(raw)) {
     throw new BadRequestException(
       'Request body must be a JSON object',
     );
   }
 
-  const body = raw as Record<string, unknown>;
+  const body = raw;
 
   for (const field of Object.keys(body)) {
     if (!ALLOWED_FIELDS.has(field)) {
@@ -140,9 +246,30 @@ function parseCommand(raw: unknown): WagerCommand {
     );
   }
 
-  for (const field of IDENTIFIER_FIELDS) {
-    requiredString(body, field, 255);
-  }
+  const providerId = requiredString(
+    body,
+    'providerId',
+    100,
+  );
+
+  const externalTransactionId =
+    requiredString(
+      body,
+      'externalTransactionId',
+      255,
+    );
+
+  const roundId = requiredString(
+    body,
+    'roundId',
+    255,
+  );
+
+  const gameId = requiredString(
+    body,
+    'gameId',
+    255,
+  );
 
   const walletId = requiredString(
     body,
@@ -165,32 +292,7 @@ function parseCommand(raw: unknown): WagerCommand {
     );
   }
 
-  const amount = requiredString(
-    body,
-    'amount',
-    20,
-  );
-
-  if (
-    !AMOUNT_PATTERN.test(amount) ||
-    /^0\.00$/.test(amount)
-  ) {
-    throw new BadRequestException(
-      'amount must be a positive decimal string with exactly two decimal places',
-    );
-  }
-
-  const currency = requiredString(
-    body,
-    'currency',
-    3,
-  );
-
-  if (!/^[A-Z]{3}$/.test(currency)) {
-    throw new BadRequestException(
-      'currency must be a three-letter uppercase ISO currency code',
-    );
-  }
+  const money = parseMoney(body);
 
   const requiresReference =
     kind === 'REFUND' ||
@@ -199,23 +301,30 @@ function parseCommand(raw: unknown): WagerCommand {
   const reference =
     body.referenceExternalTransactionId;
 
+  let referenceExternalTransactionId:
+    | string
+    | undefined;
+
   if (requiresReference) {
-    requiredString(
-      body,
-      'referenceExternalTransactionId',
-      255,
-    );
+    referenceExternalTransactionId =
+      requiredString(
+        body,
+        'referenceExternalTransactionId',
+        255,
+      );
 
     if (
-      reference === body.externalTransactionId
+      referenceExternalTransactionId ===
+      externalTransactionId
     ) {
       throw new BadRequestException(
         'A transaction cannot reference itself',
       );
     }
   } else if (reference !== undefined) {
-    // WIN reference validation is not implemented
-    // by its use case. Do not silently discard it.
+    // The current WIN use case does not support
+    // an optional reference. Reject rather than
+    // silently ignoring it.
     throw new BadRequestException(
       `${kind} does not accept referenceExternalTransactionId`,
     );
@@ -223,19 +332,17 @@ function parseCommand(raw: unknown): WagerCommand {
 
   return {
     kind,
-    providerId: body.providerId as string,
-    externalTransactionId:
-      body.externalTransactionId as string,
+    providerId,
+    externalTransactionId,
     walletId,
     playerId,
-    roundId: body.roundId as string,
-    gameId: body.gameId as string,
-    amount,
-    currency,
-    ...(requiresReference
+    roundId,
+    gameId,
+    amount: money.amount,
+    currency: money.currency,
+    ...(referenceExternalTransactionId
       ? {
-        referenceExternalTransactionId:
-          reference as string,
+        referenceExternalTransactionId,
       }
       : {}),
   };
@@ -252,10 +359,11 @@ const CONFLICT_ERROR_NAMES = new Set([
   'RollbackInsufficientFundsError',
 ]);
 
-const INVALID_REFERENCE_ERROR_NAMES = new Set([
-  'RefundInvalidReferenceError',
-  'RollbackInvalidReferenceError',
-]);
+const INVALID_REFERENCE_ERROR_NAMES =
+  new Set([
+    'RefundInvalidReferenceError',
+    'RollbackInvalidReferenceError',
+  ]);
 
 function handleBusinessError(
   error: unknown,
@@ -270,7 +378,9 @@ function handleBusinessError(
     );
   }
 
-  if (CONFLICT_ERROR_NAMES.has(error.name)) {
+  if (
+    CONFLICT_ERROR_NAMES.has(error.name)
+  ) {
     throw new ConflictException({
       code: error.name,
       message: error.message,
@@ -278,7 +388,9 @@ function handleBusinessError(
   }
 
   if (
-    INVALID_REFERENCE_ERROR_NAMES.has(error.name)
+    INVALID_REFERENCE_ERROR_NAMES.has(
+      error.name,
+    )
   ) {
     throw new BadRequestException({
       code: error.name,
@@ -286,14 +398,16 @@ function handleBusinessError(
     });
   }
 
-  if (error.name === 'WalletNotFoundError') {
+  if (
+    error.name === 'WalletNotFoundError'
+  ) {
     throw new NotFoundException(
       'Wallet not found',
     );
   }
 
-  // Unknown application/database errors must not
-  // be misrepresented as validation errors.
+  // Unexpected infrastructure failures must
+  // remain server errors, not business errors.
   throw error;
 }
 
@@ -330,6 +444,8 @@ export class WageringCommandController {
 
     const command = parseCommand(rawBody);
 
+    // Both accepted HTTP representations produce
+    // exactly the same application command.
     const common = {
       providerId: command.providerId,
       externalTransactionId:
@@ -369,7 +485,7 @@ export class WageringCommandController {
           });
       }
     } catch (error) {
-      return handleBusinessError(error);
+      handleBusinessError(error);
     }
   }
 }

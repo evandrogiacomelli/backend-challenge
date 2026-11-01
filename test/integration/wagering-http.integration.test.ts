@@ -537,4 +537,93 @@ describe('Real HTTP wagering integration', () => {
       expect(byProvider.body.kind).toBe('BET');
     },
   );
+
+
+  test(
+    'accepts the official nested money contract',
+    async () => {
+      const wallet = await createWallet();
+      const input = wagerBody(wallet, 'BET');
+
+      const {
+        amount,
+        currency,
+        ...businessFields
+      } = input;
+
+      const response = await postWager({
+        ...businessFields,
+        money: {
+          amount,
+          currency,
+        },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('PROCESSED');
+      expect(response.body.balance.amount)
+        .toBe('70.00');
+    },
+  );
+
+  test(
+    'rejects mixing nested and flat money fields',
+    async () => {
+      const wallet = await createWallet();
+
+      const input = {
+        ...wagerBody(wallet, 'BET'),
+        money: {
+          amount: '30.00',
+          currency: 'BRL',
+        },
+      };
+
+      const response = await postWager<ApiError>(
+        input,
+      );
+
+      expect(response.status).toBe(400);
+    },
+  );
+
+  test(
+    'normalizes both money formats for idempotent replay',
+    async () => {
+      const wallet = await createWallet();
+      const input = wagerBody(wallet, 'BET');
+      const key = randomUUID();
+
+      const first = await postWager(input, key);
+
+      const {
+        amount,
+        currency,
+        ...businessFields
+      } = input;
+
+      const replay = await postWager(
+        {
+          ...businessFields,
+          money: {
+            amount,
+            currency,
+          },
+        },
+        key,
+      );
+
+      expect(first.status).toBe(200);
+      expect(replay.status).toBe(200);
+
+      expect(first.body.transactionId)
+        .toBe(replay.body.transactionId);
+
+      expect(replay.body.idempotentReplay)
+        .toBe(true);
+
+      expect(replay.body.balance.amount)
+        .toBe('70.00');
+    },
+  );
 });
