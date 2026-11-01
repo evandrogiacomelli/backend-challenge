@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import type { ProcessBetInput } from '../../../wagering/application/use-cases/process-bet.use-case.js';
 import type { ProcessWinInput } from '../../../wagering/application/use-cases/process-win.use-case.js';
 import type { InboxReceipt } from '../../../wagering/application/ports/bet-transaction-runner.js';
+import { ProcessLossInput } from '../../../wagering/application/use-cases/process-loss.use-case.js';
 
 export const WAGER_CONSUMER_NAME = 'wager-transactions-v1';
 
@@ -13,9 +14,24 @@ export class InvalidWagerMessageError extends Error {
   }
 }
 
+
 export type ParsedWagerMessage =
-  | { kind: 'BET'; input: ProcessBetInput; inbox: InboxReceipt }
-  | { kind: 'WIN'; input: ProcessWinInput; inbox: InboxReceipt };
+  | {
+  kind: 'BET';
+  input: ProcessBetInput;
+  inbox: InboxReceipt;
+}
+  | {
+  kind: 'WIN';
+  input: ProcessWinInput;
+  inbox: InboxReceipt;
+}
+  | {
+  kind: 'LOSS';
+  input: ProcessLossInput;
+  inbox: InboxReceipt;
+};
+
 
 function object(value: unknown, field: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -62,8 +78,14 @@ export function parseWagerMessage(body: string): ParsedWagerMessage {
 
   const data = object(envelope.data, 'data');
   const kind = data.kind;
-  if (kind !== 'BET' && kind !== 'WIN') {
-    throw new InvalidWagerMessageError('Only BET and WIN are supported by this consumer');
+  if (
+    data.kind !== 'BET' &&
+    data.kind !== 'WIN' &&
+    data.kind !== 'LOSS'
+  ) {
+    throw new InvalidWagerMessageError(
+      'Unsupported wager kind',
+    );
   }
   const money = object(data.money, 'data.money');
   const common = {
@@ -81,22 +103,50 @@ export function parseWagerMessage(body: string): ParsedWagerMessage {
   const inbox: InboxReceipt = {
     consumerName: WAGER_CONSUMER_NAME,
     messageId,
-    payloadHash: createHash('sha256').update(canonicalize(envelope)).digest('hex'),
+    payloadHash: createHash('sha256')
+      .update(canonicalize(envelope))
+      .digest('hex'),
   };
 
-  // A WIN reference is intentionally rejected by ProcessWinUseCase until
-  // its persistent reference validation is implemented. Never discard it.
   if (kind === 'WIN') {
-    const referenceExternalTransactionId = data.referenceExternalTransactionId === undefined
-      ? undefined
-      : requiredString(data.referenceExternalTransactionId, 'referenceExternalTransactionId');
+    const referenceExternalTransactionId =
+      data.referenceExternalTransactionId === undefined
+        ? undefined
+        : requiredString(
+          data.referenceExternalTransactionId,
+          'referenceExternalTransactionId',
+        );
 
     return {
       kind: 'WIN',
       inbox,
-      input: { ...common, ...(referenceExternalTransactionId === undefined ? {} : { referenceExternalTransactionId }) },
+      input: {
+        ...common,
+        ...(referenceExternalTransactionId === undefined
+          ? {}
+          : { referenceExternalTransactionId }),
+      },
     };
   }
+
+  if (kind === 'LOSS') {
+    return {
+      kind: 'LOSS',
+      inbox,
+      input: {
+        ...common,
+      },
+    };
+  }
+
+  return {
+    kind: 'BET',
+    inbox,
+    input: {
+      ...common,
+    },
+  };
+
 
   if (data.referenceExternalTransactionId !== undefined) {
     throw new InvalidWagerMessageError('BET does not support referenceExternalTransactionId');
