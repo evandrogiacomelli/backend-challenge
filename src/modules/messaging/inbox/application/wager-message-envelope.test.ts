@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import { InvalidWagerMessageError, parseWagerMessage } from './wager-message-envelope.js';
 
+
 function envelope(kind: string, overrides: Record<string, unknown> = {}) {
   return {
     messageId: randomUUID(),
@@ -20,6 +21,34 @@ function envelope(kind: string, overrides: Record<string, unknown> = {}) {
       ...overrides,
     },
   };
+}
+
+function reversalMessage(
+  kind: 'REFUND' | 'ROLLBACK',
+  referenceExternalTransactionId?: string,
+) {
+  const externalTransactionId = randomUUID();
+
+  return JSON.stringify({
+    messageId: randomUUID(),
+    type: 'WagerTransactionRequested',
+    occurredAt: new Date().toISOString(),
+    data: {
+      kind,
+      providerId: 'parser-tests',
+      externalTransactionId,
+      idempotencyKey: randomUUID(),
+      referenceExternalTransactionId,
+      walletId: randomUUID(),
+      playerId: randomUUID(),
+      roundId: randomUUID(),
+      gameId: 'parser-game',
+      money: {
+        amount: '30.00',
+        currency: 'BRL',
+      },
+    },
+  });
 }
 
 describe('Wager message envelope BET / WIN', () => {
@@ -65,4 +94,77 @@ describe('Wager message envelope BET / WIN', () => {
     expect(() => parseWagerMessage(JSON.stringify(envelope('REFUND'))))
       .toThrow(InvalidWagerMessageError);
   });
+
+  test('parses REFUND with required reference', () => {
+    const reference = randomUUID();
+
+    const result = parseWagerMessage(
+      reversalMessage('REFUND', reference),
+    );
+
+    expect(result.kind).toBe('REFUND');
+
+    if (result.kind !== 'REFUND') {
+      throw new Error('Unexpected kind');
+    }
+
+    expect(
+      result.input.referenceExternalTransactionId,
+    ).toBe(reference);
+
+    expect(result.inbox.payloadHash).toHaveLength(64);
+  });
+
+  test('parses ROLLBACK with required reference', () => {
+    const reference = randomUUID();
+
+    const result = parseWagerMessage(
+      reversalMessage('ROLLBACK', reference),
+    );
+
+    expect(result.kind).toBe('ROLLBACK');
+
+    if (result.kind !== 'ROLLBACK') {
+      throw new Error('Unexpected kind');
+    }
+
+    expect(
+      result.input.referenceExternalTransactionId,
+    ).toBe(reference);
+  });
+
+  test('rejects REFUND without reference', () => {
+    expect(() =>
+      parseWagerMessage(
+        reversalMessage('REFUND'),
+      ),
+    ).toThrow(InvalidWagerMessageError);
+  });
+
+  test('rejects ROLLBACK without reference', () => {
+    expect(() =>
+      parseWagerMessage(
+        reversalMessage('ROLLBACK'),
+      ),
+    ).toThrow(InvalidWagerMessageError);
+  });
+
+  test('rejects reversal referencing itself', () => {
+    const parsed = JSON.parse(
+      reversalMessage('ROLLBACK', randomUUID()),
+    ) as {
+      data: {
+        externalTransactionId: string;
+        referenceExternalTransactionId: string;
+      };
+    };
+
+    parsed.data.referenceExternalTransactionId =
+      parsed.data.externalTransactionId;
+
+    expect(() =>
+      parseWagerMessage(JSON.stringify(parsed)),
+    ).toThrow(InvalidWagerMessageError);
+  });
+
 });

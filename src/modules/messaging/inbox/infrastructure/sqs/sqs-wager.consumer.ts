@@ -13,13 +13,33 @@ import {
   Optional,
 } from '@nestjs/common';
 
-import { InboxAlreadyProcessedError } from '../../../../wagering/application/ports/bet-transaction-runner.js';
+import {
+  InboxAlreadyProcessedError,
+} from '../../../../wagering/application/ports/bet-transaction-runner.js';
 
-import { ProcessBetUseCase } from '../../../../wagering/application/use-cases/process-bet.use-case.js';
-import { ProcessWinUseCase } from '../../../../wagering/application/use-cases/process-win.use-case.js';
-import { ProcessLossUseCase } from '../../../../wagering/application/use-cases/process-loss.use-case.js';
+import {
+  ProcessBetUseCase,
+} from '../../../../wagering/application/use-cases/process-bet.use-case.js';
 
-import { parseWagerMessage } from '../../application/wager-message-envelope.js';
+import {
+  ProcessWinUseCase,
+} from '../../../../wagering/application/use-cases/process-win.use-case.js';
+
+import {
+  ProcessLossUseCase,
+} from '../../../../wagering/application/use-cases/process-loss.use-case.js';
+
+import {
+  ProcessRefundUseCase,
+} from '../../../../wagering/application/use-cases/process-refund.use-case.js';
+
+import {
+  ProcessRollbackUseCase,
+} from '../../../../wagering/application/use-cases/process-rollback.use-case.js';
+
+import {
+  parseWagerMessage,
+} from '../../application/wager-message-envelope.js';
 
 export const SQS_WAGER_CLIENT = Symbol(
   'SQS_WAGER_CLIENT',
@@ -51,13 +71,19 @@ export class SqsWagerConsumer {
 
     private readonly processBet: ProcessBetUseCase,
 
-    // Optional for compatibility with older unit tests.
-    // Missing processors must never silently ACK messages.
+    // Keep the original constructor positions
+    // for compatibility with existing unit tests.
     @Optional()
     private readonly processWin?: ProcessWinUseCase,
 
     @Optional()
     private readonly processLoss?: ProcessLossUseCase,
+
+    @Optional()
+    private readonly processRefund?: ProcessRefundUseCase,
+
+    @Optional()
+    private readonly processRollback?: ProcessRollbackUseCase,
   ) {}
 
   async pollOnce(): Promise<ConsumeResult> {
@@ -103,14 +129,15 @@ export class SqsWagerConsumer {
         message.Body ?? '',
       );
 
-      const input = {
-        ...parsed.input,
-        inbox: parsed.inbox,
-      };
-
+      // Each case creates its own input so TypeScript
+      // preserves the discriminated union narrowing.
       switch (parsed.kind) {
         case 'BET': {
-          await this.processBet.execute(input);
+          await this.processBet.execute({
+            ...parsed.input,
+            inbox: parsed.inbox,
+          });
+
           break;
         }
 
@@ -121,7 +148,11 @@ export class SqsWagerConsumer {
             );
           }
 
-          await this.processWin.execute(input);
+          await this.processWin.execute({
+            ...parsed.input,
+            inbox: parsed.inbox,
+          });
+
           break;
         }
 
@@ -132,24 +163,60 @@ export class SqsWagerConsumer {
             );
           }
 
-          await this.processLoss.execute(input);
+          await this.processLoss.execute({
+            ...parsed.input,
+            inbox: parsed.inbox,
+          });
+
+          break;
+        }
+
+        case 'REFUND': {
+          if (!this.processRefund) {
+            throw new Error(
+              'REFUND processor is not registered',
+            );
+          }
+
+          // PROCESSED and PENDING_REFERENCE both
+          // represent committed PostgreSQL states.
+          await this.processRefund.execute({
+            ...parsed.input,
+            inbox: parsed.inbox,
+          });
+
+          break;
+        }
+
+        case 'ROLLBACK': {
+          if (!this.processRollback) {
+            throw new Error(
+              'ROLLBACK processor is not registered',
+            );
+          }
+
+          await this.processRollback.execute({
+            ...parsed.input,
+            inbox: parsed.inbox,
+          });
+
           break;
         }
 
         default: {
           const exhaustive: never = parsed;
+
           throw new Error(
             `Unsupported wager kind: ${String(exhaustive)}`,
           );
         }
       }
-    } catch (error) {
+    } catch (error: unknown) {
       if (
         error instanceof InboxAlreadyProcessedError
       ) {
-        // The previous attempt already committed
-        // the Inbox and the financial transaction.
-        // ACK without processing again.
+        // The same message was already committed.
+        // Acknowledge the SQS redelivery.
         duplicate = true;
       } else {
         const attempts = Math.max(
@@ -174,16 +241,13 @@ export class SqsWagerConsumer {
           }`,
         );
 
-        // Do not ACK unsuccessful processing.
-        // The SQS redrive policy can eventually
-        // move the message to the DLQ.
+        // Never acknowledge unsuccessful
+        // financial processing.
         await this.client.send(
           new ChangeMessageVisibilityCommand({
             QueueUrl: this.queueUrl,
-            ReceiptHandle:
-            message.ReceiptHandle,
-            VisibilityTimeout:
-            delaySeconds,
+            ReceiptHandle: message.ReceiptHandle,
+            VisibilityTimeout: delaySeconds,
           }),
         );
 
@@ -196,14 +260,13 @@ export class SqsWagerConsumer {
       }
     }
 
-    // Delete only after the PostgreSQL transaction
-    // commits, or when an existing completed Inbox
-    // proves this message was already processed.
+    // PostgreSQL must commit before ACK.
+    // DeleteMessage failure propagates to caller,
+    // allowing SQS to redeliver the same message.
     await this.client.send(
       new DeleteMessageCommand({
         QueueUrl: this.queueUrl,
-        ReceiptHandle:
-        message.ReceiptHandle,
+        ReceiptHandle: message.ReceiptHandle,
       }),
     );
 

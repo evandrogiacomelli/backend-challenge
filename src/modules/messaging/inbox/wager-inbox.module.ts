@@ -1,17 +1,34 @@
-import { SQSClient } from '@aws-sdk/client-sqs';
-import { Module } from '@nestjs/common';
+import {
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 
-import { WageringModule } from '../../wagering/wagering.module.js';
+import {
+  Module,
+} from '@nestjs/common';
+
+import {
+  WageringModule,
+} from '../../wagering/wagering.module.js';
+
 import {
   SQS_WAGER_CLIENT,
   SQS_WAGER_QUEUE_URL,
   SqsWagerConsumer,
 } from './infrastructure/sqs/sqs-wager.consumer.js';
 
+import {
+  SqsWagerWorker,
+} from './infrastructure/sqs/sqs-wager.worker.js';
+
 @Module({
-  imports: [WageringModule],
+  imports: [
+    WageringModule,
+  ],
+
   providers: [
     SqsWagerConsumer,
+    SqsWagerWorker,
+
     {
       provide: SQS_WAGER_QUEUE_URL,
       useFactory: () => {
@@ -27,14 +44,18 @@ import {
         return queueUrl;
       },
     },
+
     {
       provide: SQS_WAGER_CLIENT,
       useFactory: () => {
-        const endpoint = process.env.SQS_ENDPOINT;
+        const endpoint =
+          process.env.SQS_ENDPOINT;
 
         return new SQSClient({
           region:
-            process.env.AWS_REGION ?? 'us-east-1',
+            process.env.AWS_REGION ??
+            'us-east-1',
+
           ...(endpoint
             ? {
               endpoint,
@@ -44,11 +65,15 @@ import {
               },
             }
             : {}),
+
           maxAttempts: 2,
         });
       },
     },
   ],
-  exports: [SqsWagerConsumer],
+
+  exports: [
+    SqsWagerConsumer,
+  ],
 })
 export class WagerInboxModule {}
