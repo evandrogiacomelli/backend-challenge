@@ -298,7 +298,9 @@ describe('PostgreSQL Wallet Reconciliation', () => {
 
       expect(firstPage.items).toHaveLength(2);
       expect(firstPage.limit).toBe(2);
-      expect(firstPage.nextCursor).toBe('2');
+      expect(firstPage.nextCursor).not.toBeNull();
+      expect(firstPage.nextCursor).not.toBe('2');
+      expect(typeof firstPage.nextCursor).toBe('string');
 
       expect(
         firstPage.items.map((item) => item.sequence),

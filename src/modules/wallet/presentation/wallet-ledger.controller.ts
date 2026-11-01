@@ -45,9 +45,18 @@ interface WalletLedgerResponse {
   limit: number;
 }
 
+interface LedgerCursorPayload {
+  v: number;
+  walletId: string;
+  sequence: string;
+}
+
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const MAX_BIGINT = 9223372036854775807n;
+
+const CURSOR_VERSION = 1;
+const MAX_CURSOR_LENGTH = 1024;
 
 @Controller('wallets')
 export class WalletLedgerController {
@@ -66,17 +75,21 @@ export class WalletLedgerController {
     @Query('limit')
     limitRaw?: string,
   ): Promise<WalletLedgerResponse> {
-    const cursor = this.parseCursor(cursorRaw);
+    const cursor = this.parseCursor(
+      cursorRaw,
+      walletId,
+    );
+
     const limit = this.parseLimit(limitRaw);
 
     const wallets = await this.em.execute<
       WalletExistsRow[]
     >(
       `
-        SELECT id::text AS id
-        FROM wallets
-        WHERE id = ?
-        LIMIT 1
+          SELECT id::text AS id
+          FROM wallets
+          WHERE id = ?
+              LIMIT 1
       `,
       [walletId],
       'all',
@@ -88,54 +101,58 @@ export class WalletLedgerController {
       );
     }
 
-    // Fetch one extra row to determine whether
-    // another page exists.
+    // Request one extra row to determine
+    // whether a subsequent page exists.
     const rows = await this.em.execute<
       LedgerRow[]
     >(
       `
-        SELECT
-          l.id::text AS "id",
+          SELECT
+              l.id::text AS "id",
 
-          p.sequence_no::text
+              p.sequence_no::text
             AS "sequence",
 
-          l.wager_transaction_id::text
+              l.wager_transaction_id::text
             AS "transactionId",
 
-          l.direction AS "direction",
+              l.direction AS "direction",
 
-          l.amount::text AS "amount",
+              l.amount::text AS "amount",
 
-          l.currency AS "currency",
+              l.currency AS "currency",
 
-          l.balance_before::text
+              l.balance_before::text
             AS "balanceBefore",
 
-          l.balance_after::text
+              l.balance_after::text
             AS "balanceAfter",
 
-          l.created_at AS "createdAt"
+              l.created_at AS "createdAt"
 
-        FROM wallet_ledger_positions p
+          FROM wallet_ledger_positions p
 
-        INNER JOIN wallet_ledger_entries l
-          ON l.id = p.ledger_entry_id
-          AND l.wallet_id = p.wallet_id
+                   INNER JOIN wallet_ledger_entries l
+                              ON l.id = p.ledger_entry_id
+                                  AND l.wallet_id = p.wallet_id
 
-        WHERE p.wallet_id = ?
-          AND p.sequence_no > CAST(? AS bigint)
+          WHERE p.wallet_id = ?
+            AND p.sequence_no > CAST(? AS bigint)
 
-        ORDER BY p.sequence_no ASC
+          ORDER BY p.sequence_no ASC
 
-        LIMIT ?
+              LIMIT ?
       `,
       [walletId, cursor, limit + 1],
       'all',
     );
 
     const hasMore = rows.length > limit;
-    const pageRows = rows.slice(0, limit);
+
+    const pageRows = rows.slice(
+      0,
+      limit,
+    );
 
     const items: LedgerEntryResponse[] =
       pageRows.map((row) => ({
@@ -154,19 +171,41 @@ export class WalletLedgerController {
 
     const lastItem = items.at(-1);
 
+    const nextCursor =
+      hasMore && lastItem
+        ? this.encodeCursor(
+          walletId,
+          lastItem.sequence,
+        )
+        : null;
+
     return {
       walletId,
       items,
-      nextCursor:
-        hasMore && lastItem
-          ? lastItem.sequence
-          : null,
+      nextCursor,
       limit,
     };
   }
 
+  private encodeCursor(
+    walletId: string,
+    sequence: string,
+  ): string {
+    const payload: LedgerCursorPayload = {
+      v: CURSOR_VERSION,
+      walletId,
+      sequence,
+    };
+
+    return Buffer.from(
+      JSON.stringify(payload),
+      'utf8',
+    ).toString('base64url');
+  }
+
   private parseCursor(
-    value?: string,
+    value: unknown,
+    walletId: string,
   ): string {
     if (value === undefined) {
       return '0';
@@ -174,26 +213,123 @@ export class WalletLedgerController {
 
     if (
       typeof value !== 'string' ||
-      !/^\d+$/.test(value)
+      value.length === 0 ||
+      value.length > MAX_CURSOR_LENGTH ||
+      !/^[A-Za-z0-9_-]+$/.test(value)
     ) {
       throw new BadRequestException(
-        'cursor must be a non-negative integer',
+        'Invalid ledger cursor',
       );
     }
 
-    const cursor = BigInt(value);
+    let decoded: unknown;
 
-    if (cursor > MAX_BIGINT) {
+    try {
+      const buffer = Buffer.from(
+        value,
+        'base64url',
+      );
+
+      // Reject malformed and noncanonical
+      // Base64URL encodings.
+      if (
+        buffer.toString('base64url') !==
+        value
+      ) {
+        throw new Error(
+          'Invalid Base64URL encoding',
+        );
+      }
+
+      decoded = JSON.parse(
+        new TextDecoder('utf-8', {
+          fatal: true,
+        }).decode(buffer),
+      );
+    } catch {
       throw new BadRequestException(
-        'cursor exceeds BIGINT range',
+        'Invalid ledger cursor',
       );
     }
 
-    return cursor.toString();
+    if (
+      decoded === null ||
+      typeof decoded !== 'object' ||
+      Array.isArray(decoded)
+    ) {
+      throw new BadRequestException(
+        'Invalid ledger cursor payload',
+      );
+    }
+
+    const payload = decoded as Record<
+      string,
+      unknown
+    >;
+
+    if (
+      Object.keys(payload).length !== 3 ||
+      !Object.hasOwn(payload, 'v') ||
+      !Object.hasOwn(payload, 'walletId') ||
+      !Object.hasOwn(payload, 'sequence')
+    ) {
+      throw new BadRequestException(
+        'Invalid ledger cursor payload',
+      );
+    }
+
+    if (
+      payload.v !== CURSOR_VERSION
+    ) {
+      throw new BadRequestException(
+        'Unsupported ledger cursor version',
+      );
+    }
+
+    if (
+      typeof payload.walletId !== 'string' ||
+      payload.walletId.toLowerCase() !==
+      walletId.toLowerCase()
+    ) {
+      throw new BadRequestException(
+        'Ledger cursor does not belong to this wallet',
+      );
+    }
+
+    if (
+      typeof payload.sequence !== 'string' ||
+      !/^[1-9]\d*$/.test(payload.sequence)
+    ) {
+      throw new BadRequestException(
+        'Invalid ledger cursor sequence',
+      );
+    }
+
+    let sequence: bigint;
+
+    try {
+      sequence = BigInt(
+        payload.sequence,
+      );
+    } catch {
+      throw new BadRequestException(
+        'Invalid ledger cursor sequence',
+      );
+    }
+
+    if (
+      sequence > MAX_BIGINT
+    ) {
+      throw new BadRequestException(
+        'Ledger cursor sequence exceeds BIGINT range',
+      );
+    }
+
+    return sequence.toString();
   }
 
   private parseLimit(
-    value?: string,
+    value: unknown,
   ): number {
     if (value === undefined) {
       return DEFAULT_LIMIT;

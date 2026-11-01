@@ -691,4 +691,112 @@ describe('Real HTTP wagering integration', () => {
     },
   );
 
+
+  test(
+    'transaction queries include a stable failureCode for a rejected BET',
+    async () => {
+      const wallet = await createWallet('10.00');
+      const input = wagerBody(wallet, 'BET', '30.00');
+
+      const result = await postWager(input);
+
+      expect(result.status).toBe(422);
+      expect(result.body.status).toBe('REJECTED');
+      expect(result.body.failureCode)
+        .toBe('INSUFFICIENT_FUNDS');
+
+      type RejectedTransaction =
+        TransactionResponse & {
+        failureCode: string | null;
+      };
+
+      const byId = await request<RejectedTransaction>(
+        `/wagering/transactions/${result.body.transactionId}`,
+      );
+
+      expect(byId.status).toBe(200);
+      expect(byId.body.status).toBe('REJECTED');
+      expect(byId.body.failureCode)
+        .toBe('INSUFFICIENT_FUNDS');
+
+      const byProvider =
+        await request<RejectedTransaction>(
+          `/providers/${input.providerId}/wagering/transactions/${input.externalTransactionId}`,
+        );
+
+      expect(byProvider.status).toBe(200);
+      expect(byProvider.body.transactionId)
+        .toBe(result.body.transactionId);
+      expect(byProvider.body.failureCode)
+        .toBe('INSUFFICIENT_FUNDS');
+    },
+  );
+
+  test(
+    'ledger pagination uses a wallet-bound opaque cursor',
+    async () => {
+      const wallet = await createWallet('100.00');
+      const otherWallet = await createWallet('100.00');
+
+      const bet = await postWager(
+        wagerBody(wallet, 'BET', '10.00'),
+      );
+
+      expect(bet.status).toBe(200);
+
+      // First page: opening transaction.
+      const first = await request<LedgerResponse>(
+        `/wallets/${wallet.id}/ledger?limit=1`,
+      );
+
+      expect(first.status).toBe(200);
+      expect(first.body.items).toHaveLength(1);
+      expect(first.body.items[0]?.sequence).toBe('1');
+
+      expect(first.body.nextCursor).not.toBeNull();
+      expect(first.body.nextCursor).not.toBe('1');
+
+      const cursor = first.body.nextCursor!;
+
+      // Second page: BET transaction.
+      const second = await request<LedgerResponse>(
+        `/wallets/${wallet.id}/ledger?limit=1&cursor=${encodeURIComponent(cursor)}`,
+      );
+
+      expect(second.status).toBe(200);
+      expect(second.body.items).toHaveLength(1);
+      expect(second.body.items[0]?.sequence).toBe('2');
+      expect(second.body.nextCursor).toBeNull();
+
+      // Pages cannot contain duplicated ledger entries.
+      const ids = [
+        first.body.items[0]?.id,
+        second.body.items[0]?.id,
+      ];
+
+      expect(new Set(ids).size).toBe(2);
+
+      // Cursor from another wallet must be rejected.
+      const differentWallet = await request<ApiError>(
+        `/wallets/${otherWallet.id}/ledger?cursor=${encodeURIComponent(cursor)}`,
+      );
+
+      expect(differentWallet.status).toBe(400);
+
+      // Old numeric cursors are no longer accepted.
+      const oldNumericCursor = await request<ApiError>(
+        `/wallets/${wallet.id}/ledger?cursor=1`,
+      );
+
+      expect(oldNumericCursor.status).toBe(400);
+
+      // Malformed cursors must be rejected.
+      const malformedCursor = await request<ApiError>(
+        `/wallets/${wallet.id}/ledger?cursor=not-valid-token`,
+      );
+
+      expect(malformedCursor.status).toBe(400);
+    },
+  );
+
 });

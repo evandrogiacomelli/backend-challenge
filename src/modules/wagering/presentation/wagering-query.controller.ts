@@ -18,21 +18,22 @@ interface TransactionRow {
   amount: string;
   currency: string;
   referenceTransactionId: string | null;
+  failureCode: string | null;
 }
 
 const TRANSACTION_COLUMNS = `
-  SELECT
-    id::text AS "transactionId",
-    provider_id AS "providerId",
-    external_transaction_id AS "externalTransactionId",
-    wallet_id::text AS "walletId",
-    kind,
-    status,
-    amount::text AS amount,
-    currency,
-    reference_transaction_id::text
-      AS "referenceTransactionId"
-  FROM wager_transactions
+    SELECT
+        id::text AS "transactionId",
+        provider_id AS "providerId",
+        external_transaction_id AS "externalTransactionId",
+        wallet_id::text AS "walletId",
+        kind,
+        status,
+        amount::text AS amount,
+        currency,
+        reference_transaction_id::text AS "referenceTransactionId",
+        failure_code AS "failureCode"
+    FROM wager_transactions
 `;
 
 @Controller()
@@ -88,10 +89,7 @@ export class WageringQueryController {
           AND external_transaction_id = ?
         LIMIT 1
       `,
-      [
-        providerId,
-        externalTransactionId,
-      ],
+      [providerId, externalTransactionId],
       'all',
     );
 
