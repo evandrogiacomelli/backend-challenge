@@ -1,8 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { IsolationLevel } from '@mikro-orm/core';
-import {
-  EntityManager,
-} from '@mikro-orm/postgresql';
+import { EntityManager } from '@mikro-orm/postgresql';
 
 import type {
   ReconciliationReport,
@@ -20,6 +18,11 @@ import {
   PostgresLedgerContinuityService,
 } from '../infrastructure/postgres-ledger-continuity.service.js';
 
+import {
+  PostgresLedgerSequenceService,
+  type LedgerSequenceReport,
+} from '../infrastructure/postgres-ledger-sequence.service.js';
+
 interface WalletIdRow {
   id: string;
 }
@@ -29,6 +32,7 @@ export interface WalletAuditResult {
   consistent: boolean;
   reconciliation: ReconciliationReport;
   chain: LedgerChainReport;
+  sequence: LedgerSequenceReport;
 }
 
 export interface WalletBatchReport {
@@ -46,10 +50,12 @@ export class WalletBatchReconciliationService {
     private readonly em: EntityManager,
   ) {}
 
-  async scanPage(options: {
-    after?: string;
-    limit?: number;
-  } = {}): Promise<WalletBatchReport> {
+  async scanPage(
+    options: {
+      after?: string;
+      limit?: number;
+    } = {},
+  ): Promise<WalletBatchReport> {
     const limit = options.limit ?? 25;
 
     if (
@@ -74,6 +80,7 @@ export class WalletBatchReconciliationService {
     return this.em.fork().transactional(
       async (tx) => {
         const params: unknown[] = [];
+
         const afterClause = options.after
           ? 'WHERE id > ?::uuid'
           : '';
@@ -82,17 +89,15 @@ export class WalletBatchReconciliationService {
           params.push(options.after);
         }
 
-        // Fetch one extra wallet to detect
-        // whether the next page exists.
         params.push(limit + 1);
 
         const rows = await tx.execute<WalletIdRow[]>(
           `
-          SELECT id
-          FROM wallets
-          ${afterClause}
-          ORDER BY id
-          LIMIT ?
+            SELECT id
+            FROM wallets
+            ${afterClause}
+            ORDER BY id
+            LIMIT ?
           `,
           params,
           'all',
@@ -102,28 +107,48 @@ export class WalletBatchReconciliationService {
         const selected = rows.slice(0, limit);
 
         const reconciler =
-          new PostgresWalletReconciliationService(tx);
+          new PostgresWalletReconciliationService(
+            tx,
+          );
 
         const chainAuditor =
-          new PostgresLedgerContinuityService(tx);
+          new PostgresLedgerContinuityService(
+            tx,
+          );
+
+        const sequenceAuditor =
+          new PostgresLedgerSequenceService(
+            tx,
+          );
 
         const results: WalletAuditResult[] = [];
 
         for (const row of selected) {
+          // All three audits share the same
+          // REPEATABLE_READ transaction.
           const reconciliation =
             await reconciler.reconcile(row.id);
 
-          const chain = await chainAuditor.audit(
-            row.id,
-          );
+          const chain =
+            await chainAuditor.audit(row.id);
+
+          const sequence =
+            await sequenceAuditor.audit(
+              row.id,
+              tx,
+            );
 
           results.push({
             walletId: row.id,
+
             consistent:
               reconciliation.consistent &&
-              chain.chainFeasible,
+              chain.chainFeasible &&
+              sequence.consistent,
+
             reconciliation,
             chain,
+            sequence,
           });
         }
 
@@ -133,11 +158,15 @@ export class WalletBatchReconciliationService {
 
         return {
           checkedAt: new Date().toISOString(),
+
           checkedCount: results.length,
           consistentCount,
+
           inconsistentCount:
             results.length - consistentCount,
+
           results,
+
           nextCursor: hasMore
             ? selected.at(-1)!.id
             : null,
