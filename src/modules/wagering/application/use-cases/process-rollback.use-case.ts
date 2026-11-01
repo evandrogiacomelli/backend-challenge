@@ -1,7 +1,7 @@
+
 import { createHash, randomUUID } from 'node:crypto';
 
 import { Inject, Injectable } from '@nestjs/common';
-import { Decimal } from 'decimal.js';
 
 import { Money } from '../../../../shared/domain/money.js';
 
@@ -21,9 +21,7 @@ import {
   ROLLBACK_TRANSACTION_RUNNER,
   RollbackAlreadyAppliedError,
   RollbackIdentityConflictError,
-  RollbackInsufficientFundsError,
   RollbackInvalidReferenceError,
-  RollbackReferenceNotFoundError,
   RollbackWriteConflictError,
   type RollbackIdentity,
   type RollbackResponseSnapshot,
@@ -106,16 +104,15 @@ export class ProcessRollbackUseCase {
 
     const identity: RollbackIdentity = {
       providerId: input.providerId,
-      externalTransactionId:
-      input.externalTransactionId,
+      externalTransactionId: input.externalTransactionId,
       idempotencyKey: input.idempotencyKey,
       payloadHash: createHash('sha256')
         .update(canonicalPayload)
         .digest('hex'),
     };
 
-    // SQS always enters the database transaction
-    // to commit its Inbox receipt atomically.
+    // SQS enters the locked transaction to ensure
+    // the Inbox receipt is committed atomically.
     const existing = input.inbox
       ? null
       : await this.runner.findExisting(identity);
@@ -129,7 +126,6 @@ export class ProcessRollbackUseCase {
         input.walletId,
         identity,
         input.referenceExternalTransactionId,
-
         async (context) => {
           if (context.existing) {
             return this.resolveExisting(
@@ -151,7 +147,6 @@ export class ProcessRollbackUseCase {
               'WALLET_CURRENCY_MISMATCH',
             );
           }
-
 
           const transaction = WagerTransaction.create({
             id: randomUUID(),
@@ -177,7 +172,8 @@ export class ProcessRollbackUseCase {
 
             const snapshot: RollbackResponseSnapshot = {
               transactionId: transaction.id,
-              status: WagerTransactionStatus.PendingReference,
+              status:
+              WagerTransactionStatus.PendingReference,
               balance: wallet.balance.toJSON(),
               walletVersion: wallet.version,
             };
@@ -203,8 +199,6 @@ export class ProcessRollbackUseCase {
             throw new RollbackAlreadyAppliedError();
           }
 
-          // The domain determines the correct
-          // direction based on the original wager.
           const direction =
             transaction.ledgerDirectionFor(reference);
 
@@ -214,14 +208,40 @@ export class ProcessRollbackUseCase {
             );
           }
 
-          // A reverse DEBIT must not make
-          // the wallet balance negative.
+          // A compensating debit must never produce
+          // a negative wallet balance.
+          //
+          // Persist the rejection instead of throwing
+          // and rolling back the entire SQL transaction.
           if (
             direction === 'DEBIT' &&
-            new Decimal(wallet.balance.toJSON().amount)
-              .lessThan(money.toJSON().amount)
+            wallet.balance.isLessThan(money)
           ) {
-            throw new RollbackInsufficientFundsError();
+            const failureCode =
+              'ROLLBACK_INSUFFICIENT_FUNDS';
+
+            transaction.reject(
+              failureCode,
+              wallet.balance,
+            );
+
+            const snapshot: RollbackResponseSnapshot = {
+              transactionId: transaction.id,
+              status: WagerTransactionStatus.Rejected,
+              failureCode,
+              balance: wallet.balance.toJSON(),
+              walletVersion: wallet.version,
+            };
+
+            await context.saveRejected(
+              transaction,
+              snapshot,
+            );
+
+            return {
+              ...snapshot,
+              idempotentReplay: false,
+            };
           }
 
           const movement =
@@ -234,8 +254,8 @@ export class ProcessRollbackUseCase {
             reference,
           });
 
-          // Never modify or delete the original
-          // ledger entry. Create a compensating entry.
+          // Never modify the original ledger entry.
+          // Record a new compensating entry.
           const ledger = WalletLedgerEntry.create({
             id: randomUUID(),
             walletId: wallet.id,
@@ -262,10 +282,8 @@ export class ProcessRollbackUseCase {
               referenceTransactionId: reference.id,
               referenceExternalTransactionId:
               input.referenceExternalTransactionId,
-
               roundId: input.roundId,
               gameId: input.gameId,
-
               direction,
               amount: money,
               balanceBefore: movement.balanceBefore,
@@ -292,20 +310,19 @@ export class ProcessRollbackUseCase {
             );
           }
 
-          // The Inbox receipt must still be
-          // committed for SQS redeliveries.
+          // Re-enter the SQL transaction so the
+          // Inbox receipt is committed for SQS.
           return this.runner.withLockedWallet(
             input.walletId,
             identity,
             input.referenceExternalTransactionId,
-
-            async ({ existing }) => {
-              if (!existing) {
+            async ({ existing: lockedExisting }) => {
+              if (!lockedExisting) {
                 throw error;
               }
 
               return this.resolveExisting(
-                existing,
+                lockedExisting,
                 identity,
               );
             },
@@ -370,7 +387,9 @@ export class ProcessRollbackUseCase {
       );
     }
 
-    if (reference.money.currency !== money.currency) {
+    if (
+      reference.money.currency !== money.currency
+    ) {
       throw new RollbackInvalidReferenceError(
         'REFERENCE_CURRENCY_MISMATCH',
       );
@@ -399,7 +418,8 @@ export class ProcessRollbackUseCase {
     }
 
     if (
-      existing.idempotencyKey !== identity.idempotencyKey ||
+      existing.idempotencyKey !==
+      identity.idempotencyKey ||
       existing.externalTransactionId !==
       identity.externalTransactionId ||
       existing.payloadHash !== identity.payloadHash
@@ -417,7 +437,9 @@ export class ProcessRollbackUseCase {
 
     return {
       ...existing.snapshot,
-      balance: { ...existing.snapshot.balance },
+      balance: {
+        ...existing.snapshot.balance,
+      },
       idempotentReplay: true,
     };
   }

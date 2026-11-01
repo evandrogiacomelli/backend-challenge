@@ -526,6 +526,124 @@ export class MikroOrmRollbackTransactionRunner
             alreadyReversed,
 
 
+            saveRejected: async (
+              transaction: WagerTransaction,
+              snapshot: RollbackResponseSnapshot,
+            ): Promise<void> => {
+              if (existing) {
+                throw new Error('Cannot reject an existing ROLLBACK identity');
+              }
+
+              if (
+                !referenceTransaction ||
+                transaction.status !== WagerTransactionStatus.Rejected ||
+                transaction.failureCode !== 'ROLLBACK_INSUFFICIENT_FUNDS' ||
+                snapshot.status !== WagerTransactionStatus.Rejected ||
+                snapshot.failureCode !== transaction.failureCode ||
+                snapshot.transactionId !== transaction.id ||
+                snapshot.walletVersion !== wallet.version ||
+                snapshot.balance.amount !== wallet.balance.toJSON().amount ||
+                snapshot.balance.currency !== wallet.currency ||
+                transaction.walletId !== wallet.id ||
+                transaction.playerId !== wallet.playerId ||
+                transaction.money.currency !== wallet.currency
+              ) {
+                throw new Error('Invalid rejected ROLLBACK context');
+              }
+
+              await tx.execute(
+                `
+                  INSERT INTO wager_transactions (
+                    id,
+                    provider_id,
+                    external_transaction_id,
+                    idempotency_key,
+                    payload_hash,
+                    wallet_id,
+                    player_id,
+                    round_id,
+                    game_id,
+                    kind,
+                    status,
+                    amount,
+                    currency,
+                    reference_external_transaction_id,
+                    reference_transaction_id,
+                    failure_code,
+                    response_snapshot,
+                    created_at
+                  )
+                  VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'ROLLBACK', 'REJECTED',
+                    ?, ?, ?, ?, ?, ?::jsonb, NOW()
+                  )
+                `,
+                [
+                  transaction.id,
+                  identity.providerId,
+                  identity.externalTransactionId,
+                  identity.idempotencyKey,
+                  identity.payloadHash,
+                  wallet.id,
+                  wallet.playerId,
+                  transaction.roundId,
+                  transaction.gameId,
+                  transaction.money.toJSON().amount,
+                  transaction.money.currency,
+                  transaction.referenceExternalTransactionId,
+                  referenceTransaction.id,
+                  transaction.failureCode,
+                  JSON.stringify(snapshot),
+                ],
+              );
+
+              const eventId = randomUUID();
+              await tx.execute(
+                `
+                  INSERT INTO outbox_messages (
+                    id,
+                    aggregate_id,
+                    event_type,
+                    payload,
+                    status,
+                    attempts,
+                    next_attempt_at,
+                    occurred_at,
+                    created_at
+                  )
+                  VALUES (
+                    ?, ?, ?, ?::jsonb,
+                    'PENDING', 0,
+                    NOW(), NOW(), NOW()
+                  )
+                `,
+                [
+                  eventId,
+                  wallet.id,
+                  'wager.rollback.rejected.v1',
+                  JSON.stringify({
+                    eventId,
+                    schemaVersion: 1,
+                    walletId: wallet.id,
+                    transactionId: transaction.id,
+                    providerId: identity.providerId,
+                    externalTransactionId: identity.externalTransactionId,
+                    referenceTransactionId: referenceTransaction.id,
+                    referenceExternalTransactionId:
+                      transaction.referenceExternalTransactionId,
+                    kind: 'ROLLBACK',
+                    status: 'REJECTED',
+                    failureCode: transaction.failureCode,
+                    amount: transaction.money.toJSON(),
+                    balance: snapshot.balance,
+                    walletVersion: snapshot.walletVersion,
+                    occurredAt: new Date().toISOString(),
+                  }),
+                ],
+              );
+            },
+
             savePendingReference: async (
               transaction: WagerTransaction,
               snapshot: RollbackResponseSnapshot,

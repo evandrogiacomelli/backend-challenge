@@ -1,11 +1,14 @@
+
 import type { Money } from '../../../../shared/domain/money.js';
 
-import type { WalletLedgerEntry } from '../../../ledger/domain/wallet-ledger-entry.js';
+import type {
+  WalletLedgerEntry,
+} from '../../../ledger/domain/wallet-ledger-entry.js';
 
-import {
-  type LedgerDirection,
-  type WagerTransaction,
-  type WagerTransactionStatus,
+import type {
+  LedgerDirection,
+  WagerTransaction,
+  WagerTransactionStatus,
 } from '../../domain/wager-transaction.js';
 
 import type {
@@ -28,6 +31,7 @@ export interface RollbackResponseSnapshot {
   status: WagerTransactionStatus;
   balance: ReturnType<Money['toJSON']>;
   walletVersion: number;
+  failureCode?: string;
 }
 
 export interface StoredRollback {
@@ -65,7 +69,6 @@ export interface RollbackPersistenceDetails {
 
   direction: LedgerDirection;
   amount: Money;
-
   balanceBefore: Money;
 }
 
@@ -74,12 +77,8 @@ export interface LockedRollbackContext {
 
   existing: StoredRollback | null;
 
-  // Rehydrated from PostgreSQL inside
-  // the wallet's locked transaction.
   referenceTransaction: WagerTransaction | null;
 
-  // True when this original transaction
-  // already has a processed reversal.
   alreadyReversed: boolean;
 
   saveProcessed(
@@ -90,6 +89,11 @@ export interface LockedRollbackContext {
   ): Promise<void>;
 
   savePendingReference(
+    transaction: WagerTransaction,
+    snapshot: RollbackResponseSnapshot,
+  ): Promise<void>;
+
+  saveRejected(
     transaction: WagerTransaction,
     snapshot: RollbackResponseSnapshot,
   ): Promise<void>;
@@ -111,8 +115,7 @@ export interface RollbackTransactionRunner {
   ): Promise<T>;
 }
 
-export class RollbackIdentityConflictError
-  extends Error {
+export class RollbackIdentityConflictError extends Error {
   constructor(
     public readonly code:
       | 'IDEMPOTENCY_KEY_CONFLICT'
@@ -123,40 +126,37 @@ export class RollbackIdentityConflictError
   }
 }
 
-export class RollbackReferenceNotFoundError
-  extends Error {
+export class RollbackReferenceNotFoundError extends Error {
   constructor() {
     super('Referenced transaction was not found');
     this.name = 'RollbackReferenceNotFoundError';
   }
 }
 
-export class RollbackInvalidReferenceError
-  extends Error {
-  constructor(public readonly code: string) {
+export class RollbackInvalidReferenceError extends Error {
+  constructor(
+    public readonly code: string,
+  ) {
     super(code);
     this.name = 'RollbackInvalidReferenceError';
   }
 }
 
-export class RollbackAlreadyAppliedError
-  extends Error {
+export class RollbackAlreadyAppliedError extends Error {
   constructor() {
     super('Transaction has already been reversed');
     this.name = 'RollbackAlreadyAppliedError';
   }
 }
 
-export class RollbackInsufficientFundsError
-  extends Error {
+export class RollbackInsufficientFundsError extends Error {
   constructor() {
     super('Insufficient funds to reverse credit');
     this.name = 'RollbackInsufficientFundsError';
   }
 }
 
-export class RollbackWriteConflictError
-  extends Error {
+export class RollbackWriteConflictError extends Error {
   constructor() {
     super('Concurrent ROLLBACK write conflict');
     this.name = 'RollbackWriteConflictError';

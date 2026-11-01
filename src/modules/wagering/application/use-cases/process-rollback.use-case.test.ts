@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+﻿import { randomUUID } from 'node:crypto';
 
 import {
   describe,
@@ -197,6 +197,17 @@ function harness(
           };
         },
 
+        saveRejected: async (transaction, snapshot) => {
+          expect(transaction.status).toBe(WagerTransactionStatus.Rejected);
+          expect(transaction.failureCode).toBe(
+            'ROLLBACK_INSUFFICIENT_FUNDS',
+          );
+          expect(snapshot.status).toBe(WagerTransactionStatus.Rejected);
+          expect(snapshot.failureCode).toBe(
+            'ROLLBACK_INSUFFICIENT_FUNDS',
+          );
+        },
+
         async saveProcessed(
           transaction,
           ledger,
@@ -324,11 +335,14 @@ describe('ProcessRollbackUseCase', () => {
       '20.00',
     );
 
-    await expect(
-      setup.useCase.execute(value),
-    ).rejects.toBeInstanceOf(
-      RollbackInsufficientFundsError,
+    const result = await setup.useCase.execute(value);
+
+    expect(result.status).toBe(WagerTransactionStatus.Rejected);
+    expect(result.failureCode).toBe(
+      'ROLLBACK_INSUFFICIENT_FUNDS',
     );
+    expect(result.balance.amount).toBe('20.00');
+    expect(result.idempotentReplay).toBe(false);
 
     expect(setup.wallet.balance.toJSON().amount)
       .toBe('20.00');
@@ -473,3 +487,4 @@ describe('ProcessRollbackUseCase', () => {
     expect(setup.saves).toBe(0);
   });
 });
+

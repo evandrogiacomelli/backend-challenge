@@ -727,13 +727,20 @@ describe(
         expect(before.wallet.balance_amount)
           .toBe('20.00');
 
-        await expect(
-          rollbackProcessor().execute(
+        const rejectedRollback =
+          await rollbackProcessor().execute(
             rollback(win),
-          ),
-        ).rejects.toBeInstanceOf(
-          RollbackInsufficientFundsError,
+          );
+
+        expect(rejectedRollback.status).toBe(
+          WagerTransactionStatus.Rejected,
         );
+
+        expect(rejectedRollback.failureCode).toBe(
+          'ROLLBACK_INSUFFICIENT_FUNDS',
+        );
+
+        expect(rejectedRollback.idempotentReplay).toBe(false);
 
         const after = await inspect(wallet.id);
 
