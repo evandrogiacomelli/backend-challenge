@@ -60,6 +60,8 @@ interface TransactionRow {
 type RecoveryStatus =
   PendingReferenceRecoveryResult['status'];
 
+const MAX_REFERENCE_ATTEMPTS = 10;
+
 @Injectable()
 export class MikroOrmPendingReferenceRecovery
   implements PendingReferenceRecovery
@@ -87,15 +89,15 @@ export class MikroOrmPendingReferenceRecovery
         // Matches the existing financial runners.
         const wallets = await tx.execute<WalletRow[]>(
           `
-            SELECT
-              id,
-              player_id,
-              currency,
-              balance_amount,
-              version
-            FROM wallets
-            WHERE id = ?
-            FOR UPDATE
+              SELECT
+                  id,
+                  player_id,
+                  currency,
+                  balance_amount,
+                  version
+              FROM wallets
+              WHERE id = ?
+                  FOR UPDATE
           `,
           [claim.walletId],
           'all',
@@ -112,29 +114,29 @@ export class MikroOrmPendingReferenceRecovery
         const pendingRows =
           await tx.execute<TransactionRow[]>(
             `
-              SELECT
-                id,
-                provider_id,
-                external_transaction_id,
-                idempotency_key,
-                payload_hash,
-                wallet_id,
-                player_id,
-                round_id,
-                game_id,
-                kind,
-                status,
-                amount::text AS amount,
-                currency,
-                reference_external_transaction_id,
-                reference_transaction_id,
-                attempts,
-                next_attempt_at,
-                created_at,
-                processed_at
-              FROM wager_transactions
-              WHERE id = ?
-              FOR UPDATE
+                SELECT
+                    id,
+                    provider_id,
+                    external_transaction_id,
+                    idempotency_key,
+                    payload_hash,
+                    wallet_id,
+                    player_id,
+                    round_id,
+                    game_id,
+                    kind,
+                    status,
+                    amount::text AS amount,
+                    currency,
+                    reference_external_transaction_id,
+                    reference_transaction_id,
+                    attempts,
+                    next_attempt_at,
+                    created_at,
+                    processed_at
+                FROM wager_transactions
+                WHERE id = ?
+                    FOR UPDATE
             `,
             [claim.id],
             'all',
@@ -179,12 +181,12 @@ export class MikroOrmPendingReferenceRecovery
           Array<{ active: boolean }>
         >(
           `
-            SELECT (
-              next_attempt_at IS NOT NULL
-              AND next_attempt_at > NOW()
-            ) AS active
-            FROM wager_transactions
-            WHERE id = ?
+              SELECT (
+                         next_attempt_at IS NOT NULL
+                             AND next_attempt_at > NOW()
+                         ) AS active
+              FROM wager_transactions
+              WHERE id = ?
           `,
           [claim.id],
           'all',
@@ -215,50 +217,114 @@ export class MikroOrmPendingReferenceRecovery
           walletVersion: version,
         });
 
+
         const reject = async (
           failureCode: string,
         ): Promise<PendingReferenceRecoveryResult> => {
+          const rejectedSnapshot = {
+            ...snapshot(WagerTransactionStatus.Rejected),
+            failureCode,
+          };
+
           const updated = await tx.execute<
             Array<{ id: string }>
           >(
             `
-              UPDATE wager_transactions
-              SET
-                status = 'REJECTED',
-                failure_code = ?,
-                response_snapshot = ?::jsonb,
+                UPDATE wager_transactions
+                SET
+                    status = 'REJECTED',
+                    failure_code = ?,
+                    resulting_balance_amount = ?,
+                    resulting_balance_currency = ?,
+                    response_snapshot = ?::jsonb,
                 next_attempt_at = NULL
-              WHERE id = ?
-                AND status = 'PENDING_REFERENCE'
-                AND attempts = ?
-                AND next_attempt_at > NOW()
-              RETURNING id
+                WHERE id = ?
+                  AND status = 'PENDING_REFERENCE'
+                  AND attempts = ?
+                  AND next_attempt_at > NOW()
+                    RETURNING id
             `,
             [
               failureCode,
-              JSON.stringify(
-                snapshot(
-                  WagerTransactionStatus.Rejected,
-                ),
-              ),
+              balanceBefore.toJSON().amount,
+              wallet.currency,
+              JSON.stringify(rejectedSnapshot),
               pending.id,
               claim.attempts,
             ],
             'all',
           );
 
-          return outcome(
-            updated.length === 1
-              ? 'REJECTED'
-              : 'STALE_CLAIM',
+          if (updated.length !== 1) {
+            return outcome('STALE_CLAIM');
+          }
+
+          // The rejection and its event commit atomically.
+          const eventId = randomUUID();
+          const occurredAt = new Date().toISOString();
+
+          await tx.execute(
+            `
+                INSERT INTO outbox_messages (
+                    id,
+                    aggregate_id,
+                    event_type,
+                    payload,
+                    status,
+                    attempts,
+                    next_attempt_at,
+                    occurred_at,
+                    created_at
+                )
+                VALUES (
+                           ?, ?, 'WagerTransactionRejected', ?::jsonb,
+                           'PENDING', 0, NOW(), NOW(), NOW()
+                       )
+            `,
+            [
+              eventId,
+              wallet.id,
+              JSON.stringify({
+                eventId,
+                eventType: 'WagerTransactionRejected',
+                version: 1,
+                aggregateId: wallet.id,
+                correlationId: pending.id,
+                occurredAt,
+                data: {
+                  transactionId: pending.id,
+                  walletId: wallet.id,
+                  providerId: pending.provider_id,
+                  externalTransactionId:
+                  pending.external_transaction_id,
+                  referenceExternalTransactionId:
+                  pending.reference_external_transaction_id,
+                  kind: pending.kind,
+                  status: 'REJECTED',
+                  failureCode,
+                  attempts: Number(pending.attempts),
+                  money: money.toJSON(),
+                  balance: rejectedSnapshot.balance,
+                  walletVersion: rejectedSnapshot.walletVersion,
+                },
+              }),
+            ],
           );
+
+          return outcome('REJECTED');
         };
 
-        const retry = async (): Promise<
-          PendingReferenceRecoveryResult
-        > => {
-          // Exponential backoff, capped at 5 minutes.
-          // Claim increments attempts before recovery.
+        const retry = async (
+          failureCodeOnExhaustion: string,
+        ): Promise<PendingReferenceRecoveryResult> => {
+          // The claimer increments attempts when acquiring the lease.
+          if (
+            Number(pending.attempts) >=
+            MAX_REFERENCE_ATTEMPTS
+          ) {
+            return reject(failureCodeOnExhaustion);
+          }
+
           const seconds = pendingReferenceRetrySeconds(
             Number(pending.attempts),
           );
@@ -267,15 +333,15 @@ export class MikroOrmPendingReferenceRecovery
             Array<{ id: string }>
           >(
             `
-              UPDATE wager_transactions
-              SET
-                next_attempt_at =
-                  NOW() + (? * INTERVAL '1 second')
-              WHERE id = ?
-                AND status = 'PENDING_REFERENCE'
-                AND attempts = ?
-                AND next_attempt_at > NOW()
-              RETURNING id
+                UPDATE wager_transactions
+                SET
+                    next_attempt_at =
+                        NOW() + (? * INTERVAL '1 second')
+                WHERE id = ?
+                  AND status = 'PENDING_REFERENCE'
+                  AND attempts = ?
+                  AND next_attempt_at > NOW()
+                    RETURNING id
             `,
             [
               seconds,
@@ -302,30 +368,30 @@ export class MikroOrmPendingReferenceRecovery
         const referenceRows =
           await tx.execute<TransactionRow[]>(
             `
-              SELECT
-                id,
-                provider_id,
-                external_transaction_id,
-                idempotency_key,
-                payload_hash,
-                wallet_id,
-                player_id,
-                round_id,
-                game_id,
-                kind,
-                status,
-                amount::text AS amount,
-                currency,
-                reference_external_transaction_id,
-                reference_transaction_id,
-                attempts,
-                next_attempt_at,
-                created_at,
-                processed_at
-              FROM wager_transactions
-              WHERE provider_id = ?
-                AND external_transaction_id = ?
-              LIMIT 1
+                SELECT
+                    id,
+                    provider_id,
+                    external_transaction_id,
+                    idempotency_key,
+                    payload_hash,
+                    wallet_id,
+                    player_id,
+                    round_id,
+                    game_id,
+                    kind,
+                    status,
+                    amount::text AS amount,
+                    currency,
+                    reference_external_transaction_id,
+                    reference_transaction_id,
+                    attempts,
+                    next_attempt_at,
+                    created_at,
+                    processed_at
+                FROM wager_transactions
+                WHERE provider_id = ?
+                  AND external_transaction_id = ?
+                    LIMIT 1
             `,
             [
               pending.provider_id,
@@ -338,14 +404,14 @@ export class MikroOrmPendingReferenceRecovery
 
         // Reference may arrive after the REFUND/ROLLBACK.
         if (!original) {
-          return retry();
+          return retry('REFERENCE_NOT_FOUND');
         }
 
         if (
           original.status === 'PENDING' ||
           original.status === 'PENDING_REFERENCE'
         ) {
-          return retry();
+          return retry('REFERENCE_NOT_PROCESSED');
         }
 
         if (
@@ -411,12 +477,12 @@ export class MikroOrmPendingReferenceRecovery
           Array<{ id: string }>
         >(
           `
-            SELECT id
-            FROM wager_transactions
-            WHERE reference_transaction_id = ?
-              AND kind IN ('REFUND', 'ROLLBACK')
-              AND status = 'PROCESSED'
-            LIMIT 1
+              SELECT id
+              FROM wager_transactions
+              WHERE reference_transaction_id = ?
+                AND kind IN ('REFUND', 'ROLLBACK')
+                AND status = 'PROCESSED'
+                  LIMIT 1
           `,
           [original.id],
           'all',
@@ -499,7 +565,7 @@ export class MikroOrmPendingReferenceRecovery
           direction === 'DEBIT' &&
           balanceBefore.isLessThan(money)
         ) {
-          return retry();
+          return retry('ROLLBACK_INSUFFICIENT_FUNDS');
         }
 
         const balanceAfter =
@@ -529,21 +595,21 @@ export class MikroOrmPendingReferenceRecovery
           Array<{ id: string }>
         >(
           `
-            UPDATE wager_transactions
-            SET
-              status = 'PROCESSED',
-              reference_transaction_id = ?,
-              resulting_balance_amount = ?,
-              resulting_balance_currency = ?,
-              response_snapshot = ?::jsonb,
+              UPDATE wager_transactions
+              SET
+                  status = 'PROCESSED',
+                  reference_transaction_id = ?,
+                  resulting_balance_amount = ?,
+                  resulting_balance_currency = ?,
+                  response_snapshot = ?::jsonb,
               failure_code = NULL,
               next_attempt_at = NULL,
               processed_at = NOW()
-            WHERE id = ?
-              AND status = 'PENDING_REFERENCE'
-              AND attempts = ?
-              AND next_attempt_at > NOW()
-            RETURNING id
+              WHERE id = ?
+                AND status = 'PENDING_REFERENCE'
+                AND attempts = ?
+                AND next_attempt_at > NOW()
+                  RETURNING id
           `,
           [
             original.id,
@@ -564,14 +630,14 @@ export class MikroOrmPendingReferenceRecovery
           Array<{ id: string }>
         >(
           `
-            UPDATE wallets
-            SET
-              balance_amount = ?,
-              version = ?,
-              updated_at = NOW()
-            WHERE id = ?
-              AND version = ?
-            RETURNING id
+              UPDATE wallets
+              SET
+                  balance_amount = ?,
+                  version = ?,
+                  updated_at = NOW()
+              WHERE id = ?
+                AND version = ?
+                  RETURNING id
           `,
           [
             balanceAfter.toJSON().amount,
@@ -593,20 +659,20 @@ export class MikroOrmPendingReferenceRecovery
         // the next sequence number.
         await tx.execute(
           `
-            INSERT INTO wallet_ledger_entries (
-              id,
-              wallet_id,
-              wager_transaction_id,
-              direction,
-              amount,
-              currency,
-              balance_before,
-              balance_after,
-              created_at
-            )
-            VALUES (
-              ?, ?, ?, ?, ?, ?, ?, ?, NOW()
-            )
+              INSERT INTO wallet_ledger_entries (
+                  id,
+                  wallet_id,
+                  wager_transaction_id,
+                  direction,
+                  amount,
+                  currency,
+                  balance_before,
+                  balance_after,
+                  created_at
+              )
+              VALUES (
+                         ?, ?, ?, ?, ?, ?, ?, ?, NOW()
+                     )
           `,
           [
             randomUUID(),
@@ -651,22 +717,22 @@ export class MikroOrmPendingReferenceRecovery
 
         await tx.execute(
           `
-            INSERT INTO outbox_messages (
-              id,
-              aggregate_id,
-              event_type,
-              payload,
-              status,
-              attempts,
-              next_attempt_at,
-              occurred_at,
-              created_at
-            )
-            VALUES (
-              ?, ?, ?, ?::jsonb,
-              'PENDING', 0,
-              NOW(), NOW(), NOW()
-            )
+              INSERT INTO outbox_messages (
+                  id,
+                  aggregate_id,
+                  event_type,
+                  payload,
+                  status,
+                  attempts,
+                  next_attempt_at,
+                  occurred_at,
+                  created_at
+              )
+              VALUES (
+                         ?, ?, ?, ?::jsonb,
+                         'PENDING', 0,
+                         NOW(), NOW(), NOW()
+                     )
           `,
           [
             eventId,
