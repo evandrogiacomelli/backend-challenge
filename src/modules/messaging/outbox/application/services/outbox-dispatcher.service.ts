@@ -1,7 +1,6 @@
-
 import { randomUUID } from 'node:crypto';
 
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 
 import {
   OUTBOX_DISPATCH_STORE,
@@ -25,6 +24,10 @@ export interface DispatchResult {
 
 @Injectable()
 export class OutboxDispatcherService {
+  private readonly logger = new Logger(
+    OutboxDispatcherService.name,
+  );
+
   constructor(
     @Inject(OUTBOX_DISPATCH_STORE)
     private readonly store: OutboxDispatchStore,
@@ -56,11 +59,32 @@ export class OutboxDispatcherService {
     for (const message of messages) {
       try {
         await this.publisher.publish(message);
-      } catch {
-        const released = await this.store.releaseForRetry(
-          message,
-          workerId,
+      } catch (error: unknown) {
+        const failure = error as {
+          name?: string;
+          code?: string;
+          $metadata?: {
+            httpStatusCode?: number;
+          };
+        } | null;
+
+        this.logger.error(
+          JSON.stringify({
+            event: 'outbox.publish.failed',
+            errorType:
+              failure?.name ?? 'UnknownError',
+            errorCode:
+              failure?.code ?? null,
+            httpStatusCode:
+              failure?.$metadata?.httpStatusCode ?? null,
+          }),
         );
+
+        const released =
+          await this.store.releaseForRetry(
+            message,
+            workerId,
+          );
 
         if (released) {
           result.failed++;
@@ -71,10 +95,11 @@ export class OutboxDispatcherService {
         continue;
       }
 
-      const acknowledged = await this.store.markPublished(
-        message,
-        workerId,
-      );
+      const acknowledged =
+        await this.store.markPublished(
+          message,
+          workerId,
+        );
 
       if (acknowledged) {
         result.published++;
