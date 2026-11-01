@@ -1,6 +1,7 @@
 import {
   Injectable,
   Logger,
+  Optional,
   type BeforeApplicationShutdown,
 } from '@nestjs/common';
 
@@ -12,6 +13,7 @@ import {
   RecoverPendingReferencesUseCase,
   type RecoverPendingReferencesResult,
 } from '../../application/use-cases/recover-pending-references.use-case.js';
+import { FinancialMetricsService } from '../../../observability/financial-metrics.service.js';
 
 @Injectable()
 export class PendingReferenceWorker
@@ -27,10 +29,15 @@ export class PendingReferenceWorker
     Promise<RecoverPendingReferencesResult | null>
     | null = null;
 
+
   constructor(
     private readonly recoverPendingReferences:
     RecoverPendingReferencesUseCase,
+
+    @Optional()
+    private readonly metrics?: FinancialMetricsService,
   ) {}
+
 
   @Interval(5_000)
   async tick(): Promise<void> {
@@ -78,9 +85,12 @@ export class PendingReferenceWorker
     }
   }
 
+
   private async processBatch(): Promise<
     RecoverPendingReferencesResult | null
   > {
+    const startedAt = Date.now();
+
     try {
       const result =
         await this.recoverPendingReferences.execute({
@@ -88,50 +98,78 @@ export class PendingReferenceWorker
           leaseSeconds: 300,
         });
 
+      const durationMs = Date.now() - startedAt;
+
+      // Metrics must never affect financial processing.
+      try {
+        this.metrics?.recordPendingRecovery(
+          result,
+          durationMs,
+        );
+      } catch {
+        this.logger.warn(
+          'Unable to record pending recovery metrics',
+        );
+      }
+
       if (result.failed > 0) {
         this.logger.warn(
-          `Pending recovery failures: ${result.failed}`,
+          JSON.stringify({
+            event: 'pending.recovery.partial_failure',
+            failed: result.failed,
+          }),
         );
-
-        for (const failure of result.failures) {
-          this.logger.error(
-            `Transaction ${failure.transactionId}: ` +
-            failure.message,
-          );
-        }
       }
 
       if (
-        result.processed > 0 ||
-        result.retryScheduled > 0 ||
-        result.rejected > 0
+        result.claimed > 0 ||
+        result.failed > 0
       ) {
         this.logger.log(
-          [
-            `Claimed=${result.claimed}`,
-            `Processed=${result.processed}`,
-            `Retried=${result.retryScheduled}`,
-            `Rejected=${result.rejected}`,
-            `Stale=${result.staleClaims}`,
-            `Failed=${result.failed}`,
-          ].join(' | '),
+          JSON.stringify({
+            event: 'pending.recovery.completed',
+            durationMs,
+            claimed: result.claimed,
+            processed: result.processed,
+            retried: result.retryScheduled,
+            rejected: result.rejected,
+            staleClaims: result.staleClaims,
+            failed: result.failed,
+          }),
         );
       }
 
       return result;
     } catch (error: unknown) {
+      const durationMs = Date.now() - startedAt;
+
+      try {
+        this.metrics?.recordPendingFailure(
+          durationMs,
+        );
+      } catch {
+        this.logger.warn(
+          'Unable to record pending failure metrics',
+        );
+      }
+
       this.logger.error(
-        'Pending reference worker execution failed',
-        error instanceof Error
-          ? error.stack
-          : String(error),
+        JSON.stringify({
+          event: 'pending.recovery.failed',
+          durationMs,
+          errorType:
+            error instanceof Error
+              ? error.name
+              : 'UnknownError',
+        }),
       );
 
-      // Never delete pending work on failure.
-      // PostgreSQL leases eventually expire.
+      // Pending references remain persisted.
+      // PostgreSQL leases provide crash recovery.
       return null;
     }
   }
+
 
   async beforeApplicationShutdown(
     signal?: string,

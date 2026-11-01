@@ -1,12 +1,15 @@
 import {
   Injectable,
   Logger,
+  Optional,
   type BeforeApplicationShutdown,
 } from '@nestjs/common';
 
+import { Interval } from '@nestjs/schedule';
+
 import {
-  Interval,
-} from '@nestjs/schedule';
+  FinancialMetricsService,
+} from '../../../../observability/financial-metrics.service.js';
 
 import {
   SqsWagerConsumer,
@@ -21,11 +24,13 @@ export class SqsWagerWorker
   );
 
   private shuttingDown = false;
-
   private inFlight: Promise<void> | null = null;
 
   constructor(
     private readonly consumer: SqsWagerConsumer,
+
+    @Optional()
+    private readonly metrics?: FinancialMetricsService,
   ) {}
 
   @Interval(1_000)
@@ -41,13 +46,11 @@ export class SqsWagerWorker
       return;
     }
 
-    // Never overlap polling inside one instance.
     if (this.inFlight !== null) {
       return;
     }
 
     const task = this.poll();
-
     this.inFlight = task;
 
     try {
@@ -60,26 +63,63 @@ export class SqsWagerWorker
   }
 
   private async poll(): Promise<void> {
+    const startedAt = Date.now();
+
     try {
       const result =
         await this.consumer.pollOnce();
+
+      const durationMs =
+        Date.now() - startedAt;
+
+      try {
+        this.metrics?.recordSqsPoll(
+          result,
+          durationMs,
+        );
+      } catch (metricsError: unknown) {
+        this.logger.warn(
+          'Unable to record SQS metrics',
+        );
+      }
 
       if (result.received === 0) {
         return;
       }
 
       this.logger.log(
-        `SQS poll: received=${result.received}, ` +
-        `acknowledged=${result.acknowledged}, ` +
-        `duplicates=${result.duplicates}, ` +
-        `retried=${result.retried}`,
+        JSON.stringify({
+          event: 'sqs.poll.completed',
+          durationMs,
+          received: result.received,
+          acknowledged: result.acknowledged,
+          duplicates: result.duplicates,
+          retried: result.retried,
+        }),
       );
     } catch (error: unknown) {
+      const durationMs =
+        Date.now() - startedAt;
+
+      try {
+        this.metrics?.recordSqsFailure(
+          durationMs,
+        );
+      } catch (metricsError: unknown) {
+        this.logger.warn(
+          'Unable to record SQS failure metrics',
+        );
+      }
+
       this.logger.error(
-        'SQS wager polling failed',
-        error instanceof Error
-          ? error.stack
-          : String(error),
+        JSON.stringify({
+          event: 'sqs.poll.failed',
+          durationMs,
+          errorType:
+            error instanceof Error
+              ? error.name
+              : 'UnknownError',
+        }),
       );
     }
   }
@@ -104,8 +144,6 @@ export class SqsWagerWorker
       'waiting for active SQS processing',
     );
 
-    // The existing consumer decides whether an ACK is
-    // safe. The worker must not acknowledge anything.
     await active;
 
     this.logger.log(

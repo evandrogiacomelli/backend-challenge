@@ -8,22 +8,86 @@ import {
   test,
 } from 'bun:test';
 
-import { MikroORM } from '@mikro-orm/postgresql';
+import {
+  Module,
+  type INestApplicationContext,
+} from '@nestjs/common';
+
+import { Test } from '@nestjs/testing';
+import { MikroOrmModule } from '@mikro-orm/nestjs';
+
+import {
+  EntityManager,
+  MikroORM,
+} from '@mikro-orm/postgresql';
+
+import {
+  ScheduleModule,
+} from '@nestjs/schedule';
 
 import mikroOrmConfig from '../../src/config/mikro-orm.config.js';
 
-import { CreateWalletUseCase } from '../../src/modules/wallet/application/use-cases/create-wallet.use-case.js';
-import { MikroOrmWalletOpeningPersistence } from '../../src/modules/wallet/infrastructure/persistence/mikro-orm-wallet-opening.persistence.js';
+import {
+  PendingReferenceModule,
+} from '../../src/modules/wagering/pending-reference.module.js';
 
-import { ProcessBetUseCase } from '../../src/modules/wagering/application/use-cases/process-bet.use-case.js';
-import { MikroOrmBetTransactionRunner } from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-bet-transaction-runner.js';
+import {
+  PENDING_REFERENCE_CLAIMER,
+  type ClaimPendingReferencesInput,
+  type PendingReferenceClaimer,
+} from '../../src/modules/wagering/application/ports/pending-reference-claimer.js';
 
-import { ProcessRefundUseCase } from '../../src/modules/wagering/application/use-cases/process-refund.use-case.js';
-import { MikroOrmRefundTransactionRunner } from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-refund-transaction-runner.js';
+import {
+  MikroOrmPendingReferenceClaimer,
+} from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-pending-reference-claimer.js';
 
-import { WagerTransactionStatus } from '../../src/modules/wagering/domain/wager-transaction.js';
+import {
+  CreateWalletUseCase,
+} from '../../src/modules/wallet/application/use-cases/create-wallet.use-case.js';
 
+import {
+  MikroOrmWalletOpeningPersistence,
+} from '../../src/modules/wallet/infrastructure/persistence/mikro-orm-wallet-opening.persistence.js';
+
+import {
+  ProcessBetUseCase,
+} from '../../src/modules/wagering/application/use-cases/process-bet.use-case.js';
+
+import {
+  MikroOrmBetTransactionRunner,
+} from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-bet-transaction-runner.js';
+
+import {
+  ProcessRefundUseCase,
+} from '../../src/modules/wagering/application/use-cases/process-refund.use-case.js';
+
+import {
+  MikroOrmRefundTransactionRunner,
+} from '../../src/modules/wagering/infrastructure/persistence/mikro-orm-refund-transaction-runner.js';
+
+import {
+  WagerTransactionStatus,
+} from '../../src/modules/wagering/domain/wager-transaction.js';
+
+@Module({
+  imports: [
+    MikroOrmModule.forRoot(mikroOrmConfig),
+    ScheduleModule.forRoot(),
+    PendingReferenceModule,
+  ],
+})
+class SchedulerE2eModule {}
+
+let app: INestApplicationContext;
 let orm: MikroORM;
+
+// Unique provider for this E2E execution.
+// Other pending references must not consume
+// this test worker's recovery batches.
+const e2eProviderId = `worker-e2e-${randomUUID()}`;
+
+const previousWorkerFlag =
+  process.env.PENDING_REFERENCE_WORKER_ENABLED;
 
 interface RecoveryState {
   status: string;
@@ -42,43 +106,45 @@ async function inspect(
     RecoveryState[]
   >(
     `
-      SELECT
-        t.status,
-        t.reference_transaction_id::text,
+        SELECT
+            t.status,
+            t.reference_transaction_id::text,
 
-        w.balance_amount::text AS balance,
-        w.version,
+            w.balance_amount::text AS balance,
+            w.version,
 
-        (
-          SELECT COUNT(*)::int
-          FROM wallet_ledger_entries l
-          WHERE l.wallet_id = w.id
-        ) AS ledger_count,
+            (
+                SELECT COUNT(*)::int
+                FROM wallet_ledger_entries l
+                WHERE l.wallet_id = w.id
+            ) AS ledger_count,
 
-        (
-          SELECT COUNT(*)::int
-          FROM wallet_ledger_positions p
-          WHERE p.wallet_id = w.id
-        ) AS positions,
+            (
+                SELECT COUNT(*)::int
+                FROM wallet_ledger_positions p
+                WHERE p.wallet_id = w.id
+            ) AS positions,
 
-        (
-          SELECT COUNT(*)::int
-          FROM outbox_messages o
-          WHERE o.aggregate_id = w.id
-            AND o.event_type =
-              'wager.refund.processed.v1'
-        ) AS refund_events
+            (
+                SELECT COUNT(*)::int
+                FROM outbox_messages o
+                WHERE o.aggregate_id = w.id
+                  AND o.event_type =
+                      'wager.refund.processed.v1'
+            ) AS refund_events
 
-      FROM wager_transactions t
-      JOIN wallets w ON w.id = t.wallet_id
-      WHERE t.id = ?
+        FROM wager_transactions t
+                 JOIN wallets w ON w.id = t.wallet_id
+        WHERE t.id = ?
     `,
     [transactionId],
     'all',
   );
 
   if (!rows[0]) {
-    throw new Error('Transaction not found');
+    throw new Error(
+      `Transaction not found: ${transactionId}`,
+    );
   }
 
   return rows[0];
@@ -89,8 +155,12 @@ async function waitForProcessed(
 ): Promise<RecoveryState> {
   const deadline = Date.now() + 35_000;
 
+  let lastStatus = 'UNKNOWN';
+
   while (Date.now() < deadline) {
     const state = await inspect(transactionId);
+
+    lastStatus = state.status;
 
     if (state.status === 'PROCESSED') {
       return state;
@@ -109,16 +179,73 @@ async function waitForProcessed(
   }
 
   throw new Error(
-    'Automatic recovery did not complete within the test deadline. Confirm NestJS scheduler is running.',
+    'Automatic recovery did not complete within ' +
+    `35 seconds. Transaction=${transactionId}, ` +
+    `provider=${e2eProviderId}, ` +
+    `lastStatus=${lastStatus}.`,
   );
 }
 
 beforeAll(async () => {
-  orm = await MikroORM.init(mikroOrmConfig);
+  process.env.PENDING_REFERENCE_WORKER_ENABLED =
+    'true';
+
+  // Override only this test module's claimer.
+  // The underlying implementation remains real:
+  // PostgreSQL transaction, lease and SKIP LOCKED.
+  const moduleRef = await Test.createTestingModule({
+    imports: [SchedulerE2eModule],
+  })
+    .overrideProvider(PENDING_REFERENCE_CLAIMER)
+    .useFactory({
+      factory: (
+        em: EntityManager,
+      ): PendingReferenceClaimer => {
+        const realClaimer =
+          new MikroOrmPendingReferenceClaimer(em);
+
+        return {
+          claimDue: (
+            input: ClaimPendingReferencesInput,
+          ) => {
+            return realClaimer.claimDue({
+              ...input,
+              providerId: e2eProviderId,
+            });
+          },
+        };
+      },
+      inject: [EntityManager],
+    })
+    .compile();
+
+  // Initialize lifecycle hooks and the
+  // actual @Interval scheduler.
+  await moduleRef.init();
+
+  app = moduleRef;
+
+  // Share the ORM managed by NestJS.
+  orm = app.get(MikroORM);
 });
 
 afterAll(async () => {
-  await orm?.close(true);
+  try {
+    if (app) {
+      // Stops the scheduler and waits for
+      // active worker shutdown hooks.
+      await app.close();
+    }
+  } finally {
+    if (previousWorkerFlag === undefined) {
+      delete process.env
+        .PENDING_REFERENCE_WORKER_ENABLED;
+    } else {
+      process.env
+        .PENDING_REFERENCE_WORKER_ENABLED =
+        previousWorkerFlag;
+    }
+  }
 });
 
 describe(
@@ -128,8 +255,9 @@ describe(
       'automatically processes REFUND after BET arrives',
       async () => {
         const playerId = randomUUID();
-        const providerId =
-          `worker-e2e-${randomUUID()}`;
+
+        // Must match the claimer override.
+        const providerId = e2eProviderId;
 
         const wallet =
           await new CreateWalletUseCase(
@@ -187,7 +315,7 @@ describe(
         expect(beforeBet.version).toBe(1);
         expect(beforeBet.ledger_count).toBe(1);
 
-        // 2. Original BET arrives.
+        // 2. Referenced BET arrives.
         const bet = await new ProcessBetUseCase(
           new MikroOrmBetTransactionRunner(
             orm.em.fork(),
@@ -215,8 +343,11 @@ describe(
         expect(afterBet.balance).toBe('70.00');
         expect(afterBet.version).toBe(2);
 
-        // 3. No manual recovery call.
-        // The separate NestJS worker must do it.
+        // 3. Real NestJS scheduler must recover
+        // REFUND without a manual worker call.
+        //
+        // Only this E2E provider is eligible
+        // for the overridden claimer.
         const recovered = await waitForProcessed(
           pending.transactionId,
         );
@@ -236,8 +367,8 @@ describe(
         expect(recovered.positions).toBe(3);
         expect(recovered.refund_events).toBe(1);
 
-        // 4. Replaying the same REFUND after
-        // recovery must return the stored result.
+        // 4. Duplicate REFUND must return
+        // the persisted financial result.
         const replay =
           await new ProcessRefundUseCase(
             new MikroOrmRefundTransactionRunner(
@@ -259,7 +390,8 @@ describe(
           '100.00',
         );
 
-        // Replay cannot produce new ledger entries.
+        // No additional ledger entry, position
+        // or outbox event can be created by replay.
         const final = await inspect(
           pending.transactionId,
         );
