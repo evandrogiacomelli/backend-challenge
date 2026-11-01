@@ -1,0 +1,7 @@
+[test]
+# Discover tests in src/ and test/.
+# Never execute compiled copies from dist/.
+pathIgnorePatterns = [
+  "dist/**",
+  "coverage/**"
+]
