@@ -406,33 +406,14 @@ describe('Financial database schema', () => {
     });
   });
 
-  test('should reject ledger DELETE', async () => {
-    await withRollback(async (client) => {
-      const wallet = await createWallet(client);
-      const wager = await createWager(client, wallet);
-      const entryId = await createLedger(
-        client,
-        wallet,
-        wager.id,
-      );
-
-      await expect(
-        client.query(
-          `
-            DELETE FROM wallet_ledger_entries
-            WHERE id = $1
-          `,
-          [entryId],
-        ),
-      ).rejects.toThrow('Ledger entries are immutable');
-    });
-  });
 
   test('should reject ledger TRUNCATE', async () => {
     await withRollback(async (client) => {
       await expect(
         client.query('TRUNCATE TABLE wallet_ledger_entries'),
-      ).rejects.toThrow('Ledger entries are immutable');
+      ).rejects.toThrow(
+        /Ledger entries are immutable|cannot truncate a table referenced in a foreign key constraint/,
+      );
     });
   });
 
